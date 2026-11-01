@@ -575,7 +575,7 @@ round-trip from the client to us-east-1 plus the ALB.
 
 ### Phase 6 — CI/CD: CodePipeline, CodeBuild, CodeDeploy ECS blue/green (2026-11-01)
 
-**Pipeline after this phase**
+**Pipeline after this phase** (beginner walkthrough of the whole flow, including how GitHub and AWS connect: [docs/cicd-github-explained.md](docs/cicd-github-explained.md))
 
 ```
  GitHub sriram-um/aws-containerized-microservices (main)
