@@ -25,7 +25,7 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 | 3 | Deploy container as a task | Amazon ECS (EC2), VPC, RDS | ✅ Done |
 | 4 | Scale with an ECS Service | ECS Service, ALB, Auto Scaling | ✅ Done |
 | 5 | Monitoring | CloudWatch, Container Insights, X-Ray | ✅ Done |
-| 6 | CI/CD pipeline | CodePipeline, CodeBuild, CodeDeploy (blue/green) | ⏳ Next |
+| 6 | CI/CD pipeline | CodePipeline, CodeBuild, CodeDeploy (blue/green) | 🟡 Done; push trigger open (manual start works) |
 | 7 | Replace EC2 with Fargate | AWS Fargate | ⬜ |
 | 8 | Spot capacity | Fargate Spot capacity providers | ⬜ |
 | 9 | Database credentials | AWS Secrets Manager | ⬜ |
@@ -573,11 +573,107 @@ round-trip from the client to us-east-1 plus the ALB.
 | Spans (Transaction Search, 10 % sampling) | cents at demo volumes |
 | **Total running with Phase 3-5** | **≈ $0.24/h** |
 
+### Phase 6 — CI/CD: CodePipeline, CodeBuild, CodeDeploy ECS blue/green (2026-11-01)
+
+**Pipeline after this phase**
+
+```
+ GitHub sriram-um/aws-containerized-microservices (main)
+   │  CodeConnections connection containerized-microservices-gh (GitHub App)
+   ▼
+ CodePipeline V2  containerized-microservices-product-service  (QUEUED)
+   ├─ Source     CodeStarSourceConnection → CODE_ZIP in the artifact bucket
+   ├─ Build      CodeBuild (ARM, amazonlinux-aarch64-standard:3.0, privileged)
+   │               pytest → docker build → push :<sha7> to ECR (skip if the tag exists)
+   │               → imageDetail.json + taskdef.json (from the CFN task definition) + appspec.yaml
+   └─ Deploy     CodeDeployToECS → deployment group product-service
+                   blue/green, ECSCanary10Percent5Minutes, blue kept 5 min,
+                   auto rollback on failure / stop request / 3 alarms
+ ALB :80 (prod) ─► target group 1 ⇄ target group 2 ◄─ ALB :8080 (test, closed by default)
+```
+
+**Design: who owns what**
+
+| Piece | Owner | Why |
+|---|---|---|
+| Task definition contents (roles, sidecar, env, health checks) | **CloudFormation** | Infrastructure stays in `template.yaml` |
+| Which revision the service runs, and its image | **CodeDeploy** (via the pipeline) | With the `CODE_DEPLOY` controller, `UpdateService` can't change the task definition, load balancers or network configuration (API docs) |
+| Glue | [`scripts/render_taskdef.py`](scripts/render_taskdef.py) | CodeBuild reads the CFN-registered revision (`TASK_DEFINITION_ARN`), strips read-only fields, sets the image to `<IMAGE1_NAME>` and `APP_VERSION` to the SHA. Unit-tested in [`tests/test_render_taskdef.py`](tests/test_render_taskdef.py) |
+| Service → task definition reference | Family name `product-service` (not `!Ref`) | Resolves to the latest ACTIVE revision at create time and **never changes** in the template, so CloudFormation never tries a forbidden update |
+| Listeners | CodeDeploy swaps their target groups on every deployment | `HttpListener`/`TestListener` must not be edited in the template afterwards (an update would point them back at target group 1) |
+
+**What was added to [`template.yaml`](template.yaml)** (plus [`buildspec.yml`](buildspec.yml), [`appspec.yaml`](appspec.yaml))
+
+| Resource | Notes |
+|---|---|
+| Service: `DeploymentController: CODE_DEPLOY` | Switched **in place** (CloudFormation docs: "No interruption"). Done in 2 deploys: first the family-name reference, then the controller. Circuit breaker and AZ rebalancing removed (ECS controller only) |
+| `ProductServiceTargetGroupGreen`, `TestListener` (:8080), `AlbTestListenerIngress` | Test listener open only to `TestTrafficCidr` (default `127.0.0.1/32` = nobody) |
+| `GitHubConnection` (`AWS::CodeConnections::Connection`) | Created PENDING; the handshake is a one-time console step. Outside the cost toggle so it never needs re-authorizing |
+| `ArtifactBucket` + policy | SSE-S3, public access blocked, bucket-owner-enforced, TLS-only policy, objects expire after 14 days |
+| `ProductServiceBuild` + `CodeBuildRole` + log group | ARM build host; role can push only to `product-service`, write only its log group and the artifact bucket |
+| `CodeDeployApplication`, `ProductServiceDeploymentGroup`, `CodeDeployRole` | AWS-managed `AWSCodeDeployRoleForECS` |
+| 3 alarms: `unhealthy-targets-tg1/tg2`, `target-5xx` (≥ 5 per minute) | Wired into the deployment group: `DEPLOYMENT_STOP_ON_ALARM` → rollback |
+| `Pipeline` + `PipelineRole` | V2, `QUEUED`; trigger on pushes to `main` that touch `services/product-service/**`, `buildspec.yml`, `appspec.yaml`, `scripts/render_taskdef.py`. The role can use only this connection, project and deployment group; `iam:PassRole` only for the two task roles to `ecs-tasks.amazonaws.com` |
+| [`infra/deploy-bucket.yaml`](infra/deploy-bucket.yaml) | Separate bootstrap stack: the template passed **51 200 bytes**, so `deploy.sh` stages it in S3 (`--s3-bucket`) |
+| Dockerfile base image | `public.ecr.aws/docker/library/python:3.12.16-slim-trixie`: the ECR Public mirror, **same digest** as Docker Hub's. CodeBuild's shared IPs would hit Docker Hub's anonymous pull limit |
+
+**Measured: the switch and the first deployment**
+
+| What | Result |
+|---|---|
+| Switching the live service to `CODE_DEPLOY` | 176 s stack update, **219/219 probe requests `200`**, no task replacement |
+| CodeBuild (native arm64) | ~43 s total, **docker build 21 s** (local QEMU build: 365 s) |
+| CodeDeploy all-at-once (first deployment, `0e48600`) | Install (green task set healthy) **2 min 23 s**, traffic shift **2 s**, then 5 min blue wait; 274/274 probe requests `200`, version switched `dcac7a8` → `0e48600` in one step |
+| CodeDeploy canary (restored release `05a34d1`) | Pipeline **856 s**: build 78 s, Install 2 min 23 s, `AllowTraffic` (canary) **5 min 1 s**, blue wait 5 min. **539/539 `200`**. During the canary 9 of 182 probes (4.9 %, small sample; configured 10 %) hit the new version, then 100 % |
+
+**Measured: failure tests**
+
+| Test | What happened | Result |
+|---|---|---|
+| 1. `/health` returns 500 when `ECS_CONTAINER_METADATA_URI_V4` is set | **CodeBuild sets that variable too**: the unit tests failed in the Build stage | Pipeline stopped before an image was built: the test gate works |
+| 2. `/health` returns 500 only in our task (`OTEL_EXPORTER_OTLP_ENDPOINT`) | Green tasks failed their container health check; ECS kept replacing them. **No alarm fired**: during Install the green target group isn't attached to any listener yet (`Target.NotInUse`), so the ALB doesn't health-check it | Stuck in Install (CodeDeploy would only time out much later). Stopped with `stop-deployment --auto-rollback-enabled`: stop **4 s**, rollback **3 s**. Production stayed `200` throughout |
+| 3. Healthy release, `/products` returns 500 (all-at-once) | Traffic shifted; the 5xx alarm went to ALARM **3 min 22 s** later; automatic rollback in **4 s** | **100 % of requests failed for ~3.5 min** (134 × `500`) |
+| 4. Same release, **canary 10 % / 5 min** | First deployment attempt was **stopped instantly**: the 5xx alarm was still in ALARM from test 3 (it took 9 min to return to OK). Second attempt: alarm 3 min 41 s after the canary started, rollback 3 s | **31 of 307 requests (10.1 %)** failed during the incident instead of 100 % |
+
+**Issues hit and fixes**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Templates with a size greater than 51,200 bytes must be deployed via an S3 Bucket` | The template grew to 58 KB | Bootstrap stack `containerized-microservices-deploy-bucket`; `deploy.sh --s3-bucket` |
+| **Pushes to GitHub don't start the pipeline** (4 pushes, waited 4-5 min each); manual runs work | Not the file-path filter: removing it changed nothing. Re-saving the pipeline didn't help either. The connection can *read* the repo (Source succeeds), but push events don't arrive | **Open** - see "Open item" below. Meanwhile runs are started with `aws codepipeline start-pipeline-execution` |
+| Test 1 never reached CodeDeploy | `ECS_CONTAINER_METADATA_URI_V4` is also set inside CodeBuild (it runs on ECS) | Keyed the demo on a variable only our task definition sets |
+| Unhealthy-target alarms can't catch a release that fails its health check | Green targets are unused (no listener) until after Install | Expected CodeDeploy behaviour: such a release never receives traffic; stop it manually (or rely on the timeout). The alarms protect after the traffic shift |
+| All-at-once exposed 100 % of users to a bad release for ~3.5 min | ALB metrics are 1-minute datapoints plus publishing delay; detection can't be much faster | `ECSCanary10Percent5Minutes`; measured blast radius 10.1 % |
+| A deployment right after an incident is stopped immediately | CodeDeploy checks the alarms at the start; the 5xx alarm stayed in ALARM for 9 min after the last error | Expected; wait for OK (or it can be acknowledged by disabling alarms for that deployment) |
+| `git reset --hard` during the clean-up discarded an uncommitted template change | My mistake | Re-applied (the stack already had it); commit infrastructure changes before git surgery |
+| Live pipeline drifted after the trigger experiment; a CloudFormation deploy didn't fix it | CloudFormation only updates resources whose *template* changed | Restored with `update-pipeline`; `detect-stack-resource-drift` → `IN_SYNC` |
+
+**Open item: push trigger.** The connection is AVAILABLE and the Source stage can read the repository.
+The most likely remaining cause is the GitHub side: push events come from the **AWS Connector for
+GitHub** app *installation*, and only for the repositories that installation can access.
+
+**Costs**
+
+| Item | Cost |
+|---|---|
+| CodeBuild `BUILD_GENERAL1_SMALL` ARM | $0.0034/min → ~$0.003 per build |
+| CodePipeline V2 | $0.002 per action execution minute → ~$0.02 per run (canary + blue wait ≈ 13 min in the deploy action) |
+| 3 alarms | $0.30/month |
+| Artifact + template buckets | cents |
+
+**Console links (us-east-1)**
+- Pipeline: https://us-east-1.console.aws.amazon.com/codesuite/codepipeline/pipelines/containerized-microservices-product-service/view?region=us-east-1
+- CodeDeploy deployments: https://us-east-1.console.aws.amazon.com/codesuite/codedeploy/applications/containerized-microservices-product-service?region=us-east-1
+- CodeBuild: https://us-east-1.console.aws.amazon.com/codesuite/codebuild/projects/containerized-microservices-product-service/history?region=us-east-1
+- Connection: https://us-east-1.console.aws.amazon.com/codesuite/settings/connections?region=us-east-1
+
 ## Repository layout
 
 ```
 template.yaml                    CloudFormation: one stack, extended per exercise
-scripts/                         lib.sh (identity guard), deploy.sh, push_image.sh, run_task.sh,
+buildspec.yml  appspec.yaml       CodeBuild / CodeDeploy (exercise 6)
+infra/deploy-bucket.yaml         bootstrap: S3 bucket that stages template.yaml
+scripts/                         lib.sh (identity guard), deploy.sh, push_image.sh, run_task.sh, render_taskdef.py,
                                  load_test.py, check_dashboard.py
 docs/                            load-test CSVs, dashboard images, cost estimate (later)
 requirements-scripts.txt         boto3 for the scripts
@@ -587,6 +683,7 @@ pytest.ini
 services/product-service/
   product_service/               FastAPI app (main, repository, config, seed, tracing)
   tests/                         unit tests
+tests/                           tests for scripts (render_taskdef)
   Dockerfile  .dockerignore  requirements.txt  requirements-dev.txt
 ```
 
@@ -641,3 +738,11 @@ scripts/push_image.sh      # build arm64 image, tag with the git SHA, push to EC
 - **Private subnets need a plan for every third-party image:** the ADOT sidecar only worked
   through an ECR pull-through cache. Account-level side effects like that (the cache repository,
   the Container Insights log group) have to go on the teardown list.
+- **Rollback is only as fast as detection:** CodeDeploy rolled back in 3-4 s every time, but ALB
+  metrics took ~3.5 min to raise the alarm. Limiting *who* sees a bad release (canary: 10.1 %
+  instead of 100 %) mattered more than the rollback speed.
+- **Know which failures your alarms can see:** a release that fails its own health check never
+  gets traffic, so traffic-based alarms stay silent and the deployment just hangs in Install.
+- **Test the failure path, not only the happy path:** four deliberate failures found the
+  test gate, the Install blind spot, the 3.5-minute exposure and the alarm cooldown that blocks
+  the next deployment. None of these showed up in the successful deployment.
