@@ -957,10 +957,13 @@ Resources:
 
   # GitHub connection: created PENDING; the handshake is completed once in the console
   # (Developer Tools > Settings > Connections). Kept outside the toggle so it never needs re-authorizing.
+  # The handshake must use an "AWS Connector for GitHub" installation on the account that OWNS the
+  # repository (sriram-um). The first connection was linked to an installation on another account:
+  # source downloads worked (public repo) but push events never arrived. Renamed = new connection.
   GitHubConnection:
     Type: AWS::CodeConnections::Connection
     Properties:
-      ConnectionName: !Sub '${AWS::StackName}-gh'
+      ConnectionName: containerized-ms-github   # max 32 characters
       ProviderType: GitHub
 
   ArtifactBucket:
