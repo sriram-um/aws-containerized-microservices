@@ -23,8 +23,8 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 | 1 | Build container | Docker | ✅ Done |
 | 2 | Push image to registry | Amazon ECR | ✅ Done |
 | 3 | Deploy container as a task | Amazon ECS (EC2), VPC, RDS | ✅ Done |
-| 4 | Scale with an ECS Service | ECS Service, ALB, Auto Scaling | ⏳ Next |
-| 5 | Monitoring | CloudWatch, Container Insights, X-Ray | ⬜ |
+| 4 | Scale with an ECS Service | ECS Service, ALB, Auto Scaling | ✅ Done |
+| 5 | Monitoring | CloudWatch, Container Insights, X-Ray | ⏳ Next |
 | 6 | CI/CD pipeline | CodePipeline, CodeBuild, CodeDeploy (blue/green) | ⬜ |
 | 7 | Replace EC2 with Fargate | AWS Fargate | ⬜ |
 | 8 | Spot capacity | Fargate Spot capacity providers | ⬜ |
@@ -374,11 +374,113 @@ all". Switch everything off with `scripts/deploy.sh EnableCompute=false EnableDa
 - VPC endpoints: https://us-east-1.console.aws.amazon.com/vpcconsole/home?region=us-east-1#Endpoints:
 - Logs: https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#logsV2:log-groups/log-group/$252Fecs$252Fcontainerized-microservices$252Fproduct-service
 
+### Phase 4 — ECS Service, Application Load Balancer and Auto Scaling (2026-11-01)
+
+**Architecture after this phase**
+
+```
+ internet ──HTTP :80──► ALB (public subnets, 1a + 1b; sg alb: 80 from 0.0.0.0/0, egress 3000 → sg app)
+                         │ listener :80 → target group (type ip, :3000, health check /health every 10 s)
+                         ▼
+              ECS Service product-service (EC2 capacity provider)
+              ├─ task (us-east-1a) ─┐  awsvpc ENIs in private subnets, sg app: 3000 from sg alb only
+              └─ task (us-east-1b) ─┤  Service Auto Scaling: CPU target 60 %, 2-6 tasks
+                                    │  capacity provider: ASG 2-3 × t4g.small (2 tasks per host)
+                                    ▼
+                         RDS PostgreSQL (unchanged)
+```
+
+**What was added to [`template.yaml`](template.yaml)**
+
+| Resource | Settings | Why |
+|---|---|---|
+| `AlbSecurityGroup` + `AlbToAppEgress` + `AppFromAlbIngress` | ALB: 80 in from anywhere, 3000 out to the app SG only; app SG: 3000 in from the ALB SG only | Separate rule resources avoid a circular reference between the two groups |
+| `LoadBalancer` (`EnableCompute`) | internet-facing, 2 public subnets, drop invalid header fields, idle timeout 60 s | |
+| `ProductServiceTargetGroup` | `ip` targets (awsvpc), health check `/health` every 10 s (2 healthy / 3 unhealthy), deregistration delay **30 s** (default 300) | Requests take milliseconds, so draining doesn't need 5 minutes. No `Name` (see issues below) |
+| `HttpListener` | :80 → forward | HTTPS needs a domain + ACM certificate; out of scope for this project |
+| `ProductService` | EC2 capacity provider; placement: **spread by AZ, then binpack memory**; deployment **min 50 % / max 100 %**, circuit breaker with rollback; grace period 30 s; **no `DesiredCount`** | See the issues table for why the deployment settings and `DesiredCount` changed |
+| `ProductServiceScalableTarget` + `ProductServiceCpuScalingPolicy` | 2–6 tasks, target tracking `ECSServiceAverageCPUUtilization` 60 %, scale-out cooldown 60 s, scale-in 120 s | |
+| ASG | `MinSize` 1 → **2**, `MaxSize` 2 → **3** | One host per AZ; 3 hosts × 2 tasks = room for the 6-task maximum |
+| Image | `adac991`: uvicorn `--timeout-keep-alive 65` | Fixes ALB 502s (see below) |
+
+**Commands run**
+
+```bash
+scripts/run_task.sh stop                         # standalone Phase 3 task
+scripts/deploy.sh                                # (5 deploys in total, see issues)
+curl http://<alb-dns>/products                   # 200
+aws ecs update-service --cluster containerized-microservices --service product-service --force-new-deployment
+.venv/Scripts/python scripts/load_test.py --concurrency 64 --duration 600 --watch-after 1200 --csv docs/load-test-phase4.csv
+scripts/push_image.sh && scripts/deploy.sh ProductServiceImageTag=adac991
+.venv/Scripts/python scripts/load_test.py --concurrency 64 --duration 300 --csv docs/load-test-phase4-keepalive.csv
+```
+
+[`scripts/load_test.py`](scripts/load_test.py) opens 64 keep-alive connections from this laptop
+and, every 15 s, records requests/s, latency and status codes together with the ECS task counts and
+the ASG instance counts. The raw data is in
+[`docs/load-test-phase4.csv`](docs/load-test-phase4.csv).
+
+**Measured: first public request and deployments**
+
+| What | Result |
+|---|---|
+| Stack update adding ALB + service + scaling | 403 s |
+| `GET /products` via ALB from the laptop | `200` in 79 ms (`/health` 200, unknown path 404) |
+| Rolling deployment, 200 % (before the fix) | stable in 161 s, 721/721 requests `200`, **but both tasks ended up in one AZ** |
+| Rolling deployment, 50/100 (after the fix) | stable in 325 s, **2283/2283 requests `200`**, tasks 1 × us-east-1a + 1 × us-east-1b |
+
+**Measured: auto scaling under load** (64 connections, load from t = 0 to 600 s)
+
+| t (s) | Event | Tasks desired/running | Hosts | req/s | p50 |
+|---|---|---|---|---|---|
+| 0–340 | 2 tasks saturated: service CPU **~96 %** (ALB `TargetResponseTime` p50 252 ms, so the latency is server-side) | 2 / 2 | 2 | ~260 | ~300 ms |
+| ~360 | Alarm → **"Setting desired count to 4"** (10:53:03, ~6 min after load start) | 4 / 2 | 2 | | |
+| ~390 | New tasks running (scaling activity complete after **70 s**) | 4 / 4 | 2 | 450–740 | 40–80 ms |
+| ~530 | Still above target → **desired 6**; both hosts are full (ENI limit), so **2 tasks PENDING** | 6 / 4 | 2 | ~550 | ~40 ms |
+| ~640 | Capacity provider launched a **3rd host** 108 s after the desired count went to 6 (10:57:51) | 6 / 4 | 3 | load ended | |
+| ~760 | The 2 pending tasks running on the new host | 6 / 6 | 3 | | |
+| ~1680 | First scale-in: **6 → 5**, ~18 min after the load stopped | 5 / 5 | 3 | | |
+
+Throughput went from ~260 to ~550–740 requests/s and p50 latency fell from ~300 ms to ~40 ms
+when the service doubled. The time from load start to the extra capacity serving traffic was
+**~6.5 min for tasks** and **~12.5 min when a new host was needed**. Most of that is CloudWatch
+alarm evaluation (3 × 1-minute datapoints above 60 %), not ECS. Scale-in is slower by design
+(15 datapoints below 54 %, one step per cooldown).
+
+**Issues hit and fixes**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Deploy rolled back: `Target group name 'containerized-microservices-product' cannot be longer than '32' characters` | ELBv2 name limit; cfn-lint doesn't check it | Removed `Name`; CloudFormation generates `contai-Produ-…`. This also lets CloudFormation *replace* the target group later |
+| Service healthy, but **both tasks on one host in us-east-1a** | ASG `MinSize: 1` → one host. The capacity provider only adds hosts when tasks *don't fit*, so `spread` had one AZ to choose from | ASG `MinSize: 2` → one host per AZ |
+| After a forced deployment, **both tasks in us-east-1b** | `MaximumPercent: 200` starts both new tasks while the old ones still hold the 1a host's ENI slots (t4g.small: 3 ENIs = host + 2 tasks), so 1b was the only free capacity | `MinimumHealthyPercent: 50`, `MaximumPercent: 100`: one task at a time, each replacement goes to the AZ that just lost a task. Trade-off: deployments take 325 s instead of 161 s, with 1 task serving meanwhile |
+| `AvailabilityZoneRebalancing: ENABLED` didn't rebalance (2 tasks in 1a, empty host in 1b, no rebalancing event in 10 min after a steady state) | AWS documents EC2 rebalancing as "best effort"; the configuration met all documented requirements | Not relied on; disabled (it doesn't support `MaximumPercent: 100` anyway). Fargate (Phase 7) removes the host ENI limit |
+| **9 × ALB `502`** in ~170 000 requests during the load test; `HTTPCode_Target_5XX` = 0 | uvicorn's keep-alive timeout (5 s) is shorter than the ALB's idle timeout (60 s): the ALB sometimes reused a connection uvicorn was closing | uvicorn `--timeout-keep-alive 65` (image `adac991`). Re-test: **0 × 5xx in 75 483 requests** |
+| A stack update **reset the scaled-out service from 4 to 2 tasks** (no scaling activity set 2; the deploy did) | `DesiredCount: 2` in the template is re-applied when CloudFormation updates the service | Removed `DesiredCount`; the scalable target's `MinCapacity: 2` sets the floor. The next update kept 4 tasks (that update changed only this property) |
+
+**Running cost while switched on** (adds to Phase 3's ≈ $0.16/h)
+
+| Item | $/hour |
+|---|---|
+| ALB | 0.0225 + LCU (≈ 0.008 per LCU; idle ≈ 0) |
+| 2nd t4g.small host (ASG min 2) | 0.017 |
+| 3rd host, only while scaled out | 0.017 |
+| **Total with 2 hosts** | **≈ $0.20/h** |
+
+**Console links (us-east-1)**
+- ECS service: https://us-east-1.console.aws.amazon.com/ecs/v2/clusters/containerized-microservices/services/product-service/health?region=us-east-1
+- Load balancer: https://us-east-1.console.aws.amazon.com/ec2/home?region=us-east-1#LoadBalancers:search=containerized-microservices-alb
+- Target groups: https://us-east-1.console.aws.amazon.com/ec2/home?region=us-east-1#TargetGroups:
+- Auto Scaling group: https://us-east-1.console.aws.amazon.com/ec2/home?region=us-east-1#AutoScalingGroups:
+- API: `http://containerized-microservices-alb-2083672321.us-east-1.elb.amazonaws.com/products` (only while `EnableCompute=true`)
+
 ## Repository layout
 
 ```
 template.yaml                    CloudFormation: one stack, extended per exercise
-scripts/                         lib.sh (identity guard), deploy.sh, push_image.sh, run_task.sh
+scripts/                         lib.sh (identity guard), deploy.sh, push_image.sh, run_task.sh, load_test.py
+docs/                            load-test CSVs, cost estimate (later)
+requirements-scripts.txt         boto3 for the scripts
 docker-compose.yml               local Postgres + seed + service
 pytest.ini
 services/product-service/
@@ -425,3 +527,10 @@ scripts/push_image.sh      # build arm64 image, tag with the git SHA, push to EC
   the goal.
 - **Test inside the boundary instead of opening it:** a command-override "probe" task verified
   ECS → RDS end to end while the security groups stayed closed.
+- **AZ spread on ECS/EC2 is only as good as the free capacity per AZ:** with 2 task slots per host,
+  three different settings (ASG minimum, deployment percentages, rebalancing) each decided whether
+  the service survived an AZ failure. Verify task AZs after every deployment; don't assume.
+- **Match keep-alive timeouts to the load balancer:** the app's idle timeout must be longer than
+  the ALB's (65 s > 60 s), or a small share of requests fail with 502s that the app never sees.
+- **Let Auto Scaling own `DesiredCount`:** keeping it in the template means every stack update
+  quietly undoes scaling.

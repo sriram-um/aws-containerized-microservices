@@ -5,3 +5,4 @@ __pycache__/
 *.env
 .env
 .playwright-mcp/
+load_test_results*.csv
