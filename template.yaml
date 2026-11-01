@@ -3,6 +3,59 @@ Description: >-
   Containerized microservices on Amazon ECS - Product Service (GET /products from PostgreSQL).
   One stack, extended exercise by exercise.
 
+Parameters:
+  EnableCompute:
+    Description: Hourly-billed compute/network pieces (VPC interface endpoints, ECS EC2 hosts). Off between demos.
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+  EnableDatabase:
+    Description: RDS PostgreSQL instance (hourly billed). Off between demos.
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+  DBPassword:
+    # Exercise 3 baseline: passed as a NoEcho parameter and given to the task as a plain
+    # environment variable. Exercise 9 replaces this with AWS Secrets Manager.
+    Description: Master password for RDS (letters, digits, - and _ only)
+    Type: String
+    NoEcho: true
+    Default: ''
+    AllowedPattern: '^$|^[A-Za-z0-9_-]{16,64}$'
+  ProductServiceImageTag:
+    Description: Image tag (git SHA) in the product-service ECR repository
+    Type: String
+    Default: f48cc4e
+  EcsAmiId:
+    Description: ECS-optimized Amazon Linux 2023 arm64 AMI (resolved from the public SSM parameter at deploy time)
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id
+  EcsInstanceType:
+    # t4g.small: 2 vCPU / 2 GiB, 3 ENIs -> 2 awsvpc tasks per host (one ENI is the host's own)
+    Type: String
+    Default: t4g.small
+
+Conditions:
+  ComputeEnabled: !Equals [!Ref EnableCompute, 'true']
+  DatabaseEnabled: !Equals [!Ref EnableDatabase, 'true']
+
+Rules:
+  PasswordWhenDatabaseEnabled:
+    RuleCondition: !Equals [!Ref EnableDatabase, 'true']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref DBPassword, '']]
+        AssertDescription: DBPassword is required when EnableDatabase=true
+
+Mappings:
+  Network:
+    Vpc: { Cidr: 10.50.0.0/16 }
+    PublicA: { Cidr: 10.50.0.0/24 }
+    PublicB: { Cidr: 10.50.1.0/24 }
+    PrivateA: { Cidr: 10.50.10.0/24 }
+    PrivateB: { Cidr: 10.50.11.0/24 }
+    DatabaseA: { Cidr: 10.50.20.0/24 }
+    DatabaseB: { Cidr: 10.50.21.0/24 }
+
 Resources:
   # ---------------------------------------------------------------------------
   # Exercise 2: Amazon ECR repository for the Product Service image
@@ -50,9 +103,543 @@ Resources:
         - Key: project
           Value: containerized-microservices
 
+  # ---------------------------------------------------------------------------
+  # Exercise 3: Networking - VPC with public (ALB, exercise 4), private (ECS) and
+  # database subnets in 2 AZs. No NAT gateway: private subnets reach AWS services
+  # only through VPC endpoints.
+  # ---------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [Network, Vpc, Cidr]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true   # required for interface endpoint private DNS
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-vpc' }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-igw' }
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !FindInMap [Network, PublicA, Cidr]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public-a' }
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !FindInMap [Network, PublicB, Cidr]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public-b' }
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !FindInMap [Network, PrivateA, Cidr]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-a' }
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !FindInMap [Network, PrivateB, Cidr]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-b' }
+
+  DatabaseSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !FindInMap [Network, DatabaseA, Cidr]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-database-a' }
+
+  DatabaseSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !FindInMap [Network, DatabaseB, Cidr]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-database-b' }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public' }
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private and database subnets: local VPC routes only (+ the S3 gateway endpoint route)
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private' }
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  DatabaseSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DatabaseSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  DatabaseSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DatabaseSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Security groups ----------------------------------------------------------
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Product Service tasks (awsvpc ENIs). Ingress from the ALB is added in exercise 4.
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-app' }
+
+  ContainerInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS container instances (host ENI). No inbound traffic.
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-ecs-host' }
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface VPC endpoints - HTTPS from tasks and container instances
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: Tasks
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ContainerInstanceSecurityGroup
+          Description: ECS agent / Docker on the hosts
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-endpoints' }
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS PostgreSQL - only from Product Service tasks
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: Product Service tasks
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-database' }
+
+  # VPC endpoints -------------------------------------------------------------
+  # S3 gateway endpoint (free): ECR stores image layers in S3; AL2023 package repos are on S3 too
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  # Interface endpoints (~$0.01/h per endpoint per AZ) - only while compute is enabled
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ComputeEnabled
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ComputeEnabled
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ComputeEnabled
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  # ECS agent on EC2 hosts: control plane, agent communication, telemetry
+  EcsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ComputeEnabled
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  EcsAgentEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ComputeEnabled
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecs-agent
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  EcsTelemetryEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ComputeEnabled
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecs-telemetry
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  # ---------------------------------------------------------------------------
+  # Exercise 3: Amazon RDS for PostgreSQL
+  # ---------------------------------------------------------------------------
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Database subnets for the Product Service
+      SubnetIds: [!Ref DatabaseSubnetA, !Ref DatabaseSubnetB]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Condition: DatabaseEnabled
+    Metadata:
+      cfn-lint:
+        config:
+          # W1011 (use a dynamic reference for secrets) is the point of exercise 9; accepted until then
+          ignore_checks: [W1011]
+    # Demo data only (re-created by the seed task) - no final snapshot
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-products'
+      Engine: postgres
+      EngineVersion: '16.15'
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBName: products
+      MasterUsername: productadmin
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - Key: project
+          Value: containerized-microservices
+
+  # ---------------------------------------------------------------------------
+  # Exercise 3: Amazon ECS cluster with an EC2 capacity provider
+  # ---------------------------------------------------------------------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref AWS::StackName
+      Tags:
+        - Key: project
+          Value: containerized-microservices
+
+  ContainerInstanceRole:
+    Type: AWS::IAM::Role
+    Condition: ComputeEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      # AWS-managed policy for the ECS agent: register the instance, poll for tasks, pull from ECR
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+
+  ContainerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: ComputeEnabled
+    Properties:
+      Roles: [!Ref ContainerInstanceRole]
+
+  ContainerInstanceLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: ComputeEnabled
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref EcsAmiId
+        InstanceType: !Ref EcsInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt ContainerInstanceProfile.Arn
+        SecurityGroupIds: [!Ref ContainerInstanceSecurityGroup]
+        MetadataOptions:
+          HttpTokens: required          # IMDSv2 only
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 30
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub '${AWS::StackName}-ecs-host' }
+              - { Key: project, Value: containerized-microservices }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            cat >> /etc/ecs/ecs.config <<EOF
+            ECS_CLUSTER=${Cluster}
+            ECS_AWSVPC_BLOCK_IMDS=true
+            ECS_ENABLE_CONTAINER_METADATA=true
+            EOF
+
+  ContainerInstanceAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: ComputeEnabled
+    # The interface endpoints must exist before the ECS agent starts, or registration stalls
+    DependsOn: [EcsEndpoint, EcsAgentEndpoint, EcsTelemetryEndpoint, EcrApiEndpoint, EcrDkrEndpoint, LogsEndpoint]
+    Properties:
+      VPCZoneIdentifier: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ContainerInstanceLaunchTemplate
+        Version: !GetAtt ContainerInstanceLaunchTemplate.LatestVersionNumber
+      MinSize: '1'
+      MaxSize: '2'
+      HealthCheckType: EC2
+      Tags:
+        - Key: project
+          Value: containerized-microservices
+          PropagateAtLaunch: true
+
+  Ec2CapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Condition: ComputeEnabled
+    Properties:
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref ContainerInstanceAutoScalingGroup
+        ManagedScaling:
+          Status: ENABLED
+          TargetCapacity: 100
+        # DISABLED: managed termination protection would need instance scale-in protection on the ASG
+        ManagedTerminationProtection: DISABLED
+
+  ClusterCapacityProviders:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Condition: ComputeEnabled
+    Properties:
+      Cluster: !Ref Cluster
+      CapacityProviders: [!Ref Ec2CapacityProvider]
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: !Ref Ec2CapacityProvider
+          Weight: 1
+
+  # Task IAM roles ---------------------------------------------------------------
+  # Execution role: used by the ECS agent to pull the image and ship logs (not by the app)
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: pull-image-and-write-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken   # account-level action, no resource scoping
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability]
+                Resource: !GetAtt ProductServiceRepository.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ProductServiceLogGroup.Arn
+
+  # Task role: AWS permissions for the application itself (none needed yet; X-Ray in exercise 5)
+  ProductServiceTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  ProductServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete       # 14-day demo logs; removed with the stack
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /ecs/${AWS::StackName}/product-service
+      RetentionInDays: 14
+
+  # Task definition: one container; the seed job runs the same image with a command override
+  ProductServiceTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: product-service
+      RequiresCompatibilities: [EC2]
+      NetworkMode: awsvpc            # each task gets its own ENI and security group
+      Cpu: '256'
+      Memory: '512'
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ProductServiceTaskRole.Arn
+      ContainerDefinitions:
+        - Name: product-service
+          Image: !Sub '${ProductServiceRepository.RepositoryUri}:${ProductServiceImageTag}'
+          Essential: true
+          ReadonlyRootFilesystem: true
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: DB_HOST
+              Value: !If [DatabaseEnabled, !GetAtt Database.Endpoint.Address, 'database-disabled']
+            - { Name: DB_PORT, Value: '5432' }
+            - { Name: DB_NAME, Value: products }
+            - { Name: DB_USER, Value: productadmin }
+            # Exercise 3 baseline only: plain-text secret in the task definition (fixed in exercise 9)
+            - { Name: DB_PASSWORD, Value: !Ref DBPassword }
+            - { Name: DB_SSLMODE, Value: require }
+            - { Name: APP_VERSION, Value: !Ref ProductServiceImageTag }
+          # ECS ignores the Dockerfile HEALTHCHECK; this is the same check
+          HealthCheck:
+            Command:
+              - CMD
+              - python
+              - -c
+              - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/health', timeout=2)"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 15
+          StopTimeout: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ProductServiceLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: product-service
+
 Outputs:
   ProductServiceRepositoryUri:
     Description: Image URI prefix for docker tag/push
     Value: !GetAtt ProductServiceRepository.RepositoryUri
   ProductServiceRepositoryArn:
     Value: !GetAtt ProductServiceRepository.Arn
+  VpcId:
+    Value: !Ref Vpc
+  PrivateSubnetIds:
+    Value: !Join [',', [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+  AppSecurityGroupId:
+    Value: !Ref AppSecurityGroup
+  ClusterName:
+    Value: !Ref Cluster
+  CapacityProviderName:
+    Condition: ComputeEnabled
+    Value: !Ref Ec2CapacityProvider
+  TaskDefinitionArn:
+    Value: !Ref ProductServiceTaskDefinition
+  LogGroupName:
+    Value: !Ref ProductServiceLogGroup
+  DatabaseEndpoint:
+    Condition: DatabaseEnabled
+    Value: !GetAtt Database.Endpoint.Address
