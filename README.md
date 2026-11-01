@@ -21,8 +21,8 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 |---|---|---|---|
 | 0 | Project setup | git, Python venv, cfn-lint | ✅ Done |
 | 1 | Build container | Docker | ✅ Done |
-| 2 | Push image to registry | Amazon ECR | ⏳ Next |
-| 3 | Deploy container as a task | Amazon ECS (EC2), VPC, RDS | ⬜ |
+| 2 | Push image to registry | Amazon ECR | ✅ Done |
+| 3 | Deploy container as a task | Amazon ECS (EC2), VPC, RDS | ⏳ Next |
 | 4 | Scale with an ECS Service | ECS Service, ALB, Auto Scaling | ⬜ |
 | 5 | Monitoring | CloudWatch, Container Insights, X-Ray | ⬜ |
 | 6 | CI/CD pipeline | CodePipeline, CodeBuild, CodeDeploy (blue/green) | ⬜ |
@@ -194,9 +194,84 @@ docker compose down -v
 | Docker Desktop sizes look wrong (`docker images`: base 384 MB, our image 248 MB) | With the containerd image store, `docker images` shows a different measure than `docker image inspect` | Compare with `docker image inspect --format '{{.Size}}'` (compressed); ECR's `imageSizeInBytes` will confirm in Phase 2 |
 | Size-comparison build failed at `pip install -r requirements-dev.txt` | The allow-list `.dockerignore` excludes everything except the runtime files (working as intended) | Built the comparison image from a temp copy outside the repo |
 
+### Phase 2 — Push the image to Amazon ECR (2026-11-01)
+
+**What was built**
+
+| Resource / file | Details |
+|---|---|
+| [`template.yaml`](template.yaml) → `AWS::ECR::Repository` **`product-service`** | Immutable tags, scan on push (basic), AES256 encryption, `EmptyOnDelete: true` (teardown works with images inside), lifecycle policy: expire untagged after 1 day, keep the 10 newest images |
+| Stack **`containerized-microservices`** (us-east-1) | First deploy of the single project stack; outputs `ProductServiceRepositoryUri`, `ProductServiceRepositoryArn` |
+| [`scripts/lib.sh`](scripts/lib.sh) | Pins `AWS_PROFILE=default`, us-east-1; `check_identity` aborts unless the caller is `arn:aws:iam::977534234172:user/sriram` |
+| [`scripts/deploy.sh`](scripts/deploy.sh) | `cfn-lint` → `aws cloudformation deploy` with tags `project=containerized-microservices`; optional `Key=Value` parameter overrides |
+| [`scripts/push_image.sh`](scripts/push_image.sh) | The four manual ECR steps below; refuses to run with uncommitted service code (the tag must match the code) and skips tags that already exist |
+
+**Manual ECR commands** (what `scripts/push_image.sh` runs):
+
+```bash
+export AWS_PROFILE=default AWS_REGION=us-east-1
+REPO_URI=977534234172.dkr.ecr.us-east-1.amazonaws.com/product-service
+TAG=$(git rev-parse --short=7 HEAD)                       # f48cc4e
+
+# 1. Authenticate Docker with ECR (token valid for 12 h)
+aws ecr get-login-password | docker login --username AWS --password-stdin 977534234172.dkr.ecr.us-east-1.amazonaws.com
+
+# 2. Build the image for arm64 (Graviton)
+docker buildx build --platform linux/arm64 --provenance=false --sbom=false \
+  -t product-service:$TAG --load services/product-service
+
+# 3. Tag it with the ECR repository URI
+docker tag product-service:$TAG $REPO_URI:$TAG
+
+# 4. Push
+docker push $REPO_URI:$TAG
+```
+
+**Why the git SHA as the tag (and no `latest`)?** With immutable tags, a tag always identifies
+exactly one image, so a task definition that references `:f48cc4e` can't change under a running
+service. Rollback means deploying the previous SHA. `latest` would need mutable tags.
+
+**Why `--provenance=false --sbom=false`?** By default BuildKit attaches attestation manifests and
+pushes an image *index*. ECR lists the attestations as extra untagged artifacts, and the "expire
+untagged" lifecycle rule would act on them. A single image manifest keeps the repository clean
+(`imageManifestMediaType: application/vnd.oci.image.manifest.v1+json`).
+
+**Verification**
+
+```bash
+aws ecr describe-images --repository-name product-service --image-ids imageTag=f48cc4e
+aws ecr describe-image-scan-findings --repository-name product-service --image-id imageTag=f48cc4e
+```
+
+**Measured**
+
+| What | Result |
+|---|---|
+| Stack create (ECR repository) | 50 s, `CREATE_COMPLETE` |
+| `push_image.sh` end to end | 31 s (the arm64 layers were cached from Phase 1; a cold arm64 build is ~290 s) |
+| Image in ECR | tag `f48cc4e`, **56.7 MB** (`imageSizeInBytes` 56 701 890), single OCI manifest, digest `sha256:f6a902b8…` |
+| Basic scan | complete 13 s after push: **5 HIGH, 10 MEDIUM, 3 LOW** |
+| Findings by package | glibc 15, sqlite3 2, zlib 1. All are Debian base-image packages, none are Python dependencies |
+| Fixes available? | No: `apt list --upgradable` in the base image shows no newer libc6 / libsqlite3-0 / zlib1g in Debian 13 |
+
+**Scan decision:** accepted for now, because no fixed packages exist yet and `apt-get upgrade`
+would change nothing. Re-check on every rebuild; the pinned base tag gets bumped when Debian
+ships fixes. Basic scanning only covers OS packages. Amazon Inspector enhanced scanning would also
+cover the Python packages, but it costs money and is left off. A smaller attack surface (a
+distroless or Chainguard Python base without sqlite3) is a possible later optimization.
+
+**Console links (us-east-1)**
+- ECR repository: https://us-east-1.console.aws.amazon.com/ecr/repositories/private/977534234172/product-service?region=us-east-1
+- CloudFormation stack: https://us-east-1.console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks?filteringText=containerized-microservices
+
+**Cost:** ECR storage $0.10/GB-month → ~57 MB ≈ **$0.006/month**. Pushes are free; basic scanning is
+free.
+
 ## Repository layout
 
 ```
+template.yaml                    CloudFormation: one stack, extended per exercise
+scripts/                         lib.sh (identity guard), deploy.sh, push_image.sh
 docker-compose.yml               local Postgres + seed + service
 pytest.ini
 services/product-service/
@@ -217,6 +292,13 @@ curl http://localhost:3000/products
 docker compose down -v
 ```
 
+## Deploying to AWS
+
+```bash
+scripts/deploy.sh          # lint + deploy the stack (aborts unless the caller is user sriram in 977534234172)
+scripts/push_image.sh      # build arm64 image, tag with the git SHA, push to ECR
+```
+
 ## Observations and lessons learned
 
 - **Multi-stage pays off even on a slim base:** the app adds 11 MB instead of 33 MB. Most of the
@@ -227,3 +309,6 @@ docker compose down -v
   the DB went down, the container stayed `healthy` and served fast `503`s, then recovered on its
   own when the DB came back. A DB-dependent health check would have restarted every task during a
   DB outage.
+- **A clean scan isn't always in your hands:** all 18 findings in the first image are in Debian
+  base packages with no fix released yet. The useful actions are a pinned base tag, rebuilding when
+  fixes land, and a smaller base image, not `apt-get upgrade` in the Dockerfile.

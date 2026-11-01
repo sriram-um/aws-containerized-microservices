@@ -1,0 +1,58 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Containerized microservices on Amazon ECS - Product Service (GET /products from PostgreSQL).
+  One stack, extended exercise by exercise.
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Exercise 2: Amazon ECR repository for the Product Service image
+  # ---------------------------------------------------------------------------
+  ProductServiceRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: product-service
+      # Images are tagged with the git SHA; immutable tags guarantee a tag always means the same image
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      # Lets the stack (and the end-of-project teardown) delete the repository with images in it
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire untagged images after 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep the 10 most recent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: project
+          Value: containerized-microservices
+
+Outputs:
+  ProductServiceRepositoryUri:
+    Description: Image URI prefix for docker tag/push
+    Value: !GetAtt ProductServiceRepository.RepositoryUri
+  ProductServiceRepositoryArn:
+    Value: !GetAtt ProductServiceRepository.Arn
