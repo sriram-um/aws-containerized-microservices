@@ -27,8 +27,8 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 | 5 | Monitoring | CloudWatch, Container Insights, X-Ray | ✅ Done |
 | 6 | CI/CD pipeline | CodePipeline, CodeBuild, CodeDeploy (blue/green) | ✅ Done |
 | 7 | Replace EC2 with Fargate | AWS Fargate | ✅ Done |
-| 8 | Spot capacity | Fargate Spot capacity providers | ⏳ Next |
-| 9 | Database credentials | AWS Secrets Manager | ⬜ |
+| 8 | Spot capacity | Fargate Spot capacity providers | ✅ Done |
+| 9 | Database credentials | AWS Secrets Manager | ⏳ Next |
 | 10 | Disaster recovery | Aurora Global Database | ⬜ |
 | 11 | Cost estimate | AWS Pricing Calculator | ⬜ |
 | 12 | Real-world project | Orders service (Project 3) on ECS | ⬜ |
@@ -784,6 +784,102 @@ What is measured: on Fargate the service CPU reached ~96-100 % at ~470 req/s wit
 The biggest saving is not the compute (-$0.02/h) but the three ECS-agent endpoints (-$0.06/h)
 that only EC2 hosts need.
 
+### Phase 8 — Fargate Spot with a capacity provider strategy (2026-11-01)
+
+**Where the strategy lives:** the service's own capacity provider strategy can't be changed under
+`CODE_DEPLOY` (Phase 7). But the AppSpec file supports `CapacityProviderStrategy`, and every
+CodeDeploy deployment creates its replacement task set with it. So the strategy is in
+[`appspec.yaml`](appspec.yaml), and the change is deployed by the pipeline like any release:
+
+```yaml
+CapacityProviderStrategy:
+  - CapacityProvider: FARGATE        # base 1: at least one task never runs on Spot
+    Base: 1
+    Weight: 1
+  - CapacityProvider: FARGATE_SPOT   # the rest: 3 of every 4 tasks on Spot
+    Base: 0
+    Weight: 3
+```
+
+**Why this strategy:** Spot tasks can be stopped with a 2-minute warning, and Fargate does *not*
+fall back to on-demand when Spot capacity runs out. `Base: 1` on `FARGATE` keeps one task that is
+never interrupted, so the service always has at least one task; the weights put most of the
+scaled-out capacity on Spot, where the savings are.
+
+| Desired tasks | Expected | Measured |
+|---|---|---|
+| 2 | 1 FARGATE + 1 FARGATE_SPOT | **1 FARGATE (1b) + 1 FARGATE_SPOT (1a)** |
+| 6 | 2 FARGATE + 4 FARGATE_SPOT | **2 FARGATE + 4 FARGATE_SPOT** (one of each kind per AZ, plus 1 extra Spot per AZ) |
+| back to 2 | base kept | **1 FARGATE + 1 FARGATE_SPOT** |
+
+**Also added: Spot interruptions are logged.** An EventBridge rule on ECS task state changes with
+`stopCode: SpotInterruption` in this cluster writes to the log group
+`/aws/events/containerized-microservices/spot-interruptions` (with the CloudWatch Logs resource
+policy EventBridge needs, Project 4 lesson). It records real interruptions; none occurred during
+the test.
+
+**Commands run**
+
+```bash
+git push                                     # appspec.yaml is in the trigger filter → pipeline started 3 s later
+aws ecs update-service --cluster containerized-microservices --service product-api --desired-count 6   # then 2
+aws ecs stop-task --cluster containerized-microservices --task <spot-task> --reason "simulated Spot interruption"
+```
+
+**Measured: the Spot deployment**
+
+| What | Result |
+|---|---|
+| Push → pipeline start | **3 s** (`WebhookV2`) |
+| Green task set (`FARGATE` + `FARGATE_SPOT`) | 3 tasks running ~50 s after creation: **Fargate Spot accepts ARM64 tasks** |
+| Deployment | Succeeded, canary + 5 min blue wait; **717/717 probe requests `200`** |
+
+**Measured: simulated Spot interruption** (stop the Spot task while the probe sends ~4 req/s; the
+service has 2 tasks)
+
+| Time | Event | After the stop |
+|---|---|---|
+| 18:20:01 | `stop-task` on the FARGATE_SPOT task | 0 |
+| 18:20:29 | ECS deregisters it from the target group, draining starts | +28 s |
+| ~18:20:59 | Draining done (`deregistration_delay` 30 s) | +58 s |
+| 18:21:13 | App gets `SIGTERM`: uvicorn `Shutting down` → `Finished server process` in **0.1 s** | +72 s |
+| 18:21:59 | Task `STOPPED` (sidecar shutdown + Fargate teardown) | +118 s |
+| 18:22:04 | **Replacement started** (on FARGATE_SPOT again: the base is still met by the on-demand task) | +123 s |
+| 18:23:11 | Replacement registered and steady | +190 s |
+| probe | **453/453 `200`** | |
+
+What this shows:
+- **Graceful shutdown works:** the ALB stops sending traffic before the container gets `SIGTERM`,
+  and uvicorn exits immediately, so no request failed.
+- **The 2-minute Spot warning is enough:** deregister + drain + `SIGTERM` took ~72 s. A longer
+  `deregistration_delay` (default 300 s) would **not** fit into a Spot interruption; 30 s does.
+- **Capacity is reduced for ~3 min:** the replacement was only started after the old task had
+  stopped. For a 2-task service that means one task carries all traffic in the meantime, which is
+  why the base task must be on-demand. (For real interruptions AWS documents that the scheduler
+  starts replacements as soon as it gets the warning; that can't be triggered on demand.)
+- **Limit of the test:** `stop-task` produces `stopCode: UserInitiated`, not `SpotInterruption`.
+  It exercises the same drain → `SIGTERM` → stop path, but not the warning or the EventBridge rule.
+
+**Issues hit and fixes**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `aws ecs wait services-stable` returned at once with `In function length(), invalid type for value: None` | The waiter's query doesn't handle `CODE_DEPLOY` (task set) services | Own wait loop: `RUNNING` task count and the primary task set's `runningCount` |
+| IDE shows errors in `appspec.yaml` (`'version' was unexpected`) | The IDE's CloudFormation linter treats every YAML file as a template | False positive; the AppSpec isn't a CloudFormation template |
+| No Fargate Spot price in the AWS Pricing API | Spot prices vary; only on-demand prices are listed (ARM: $0.03238/vCPU-h, $0.00356/GB-h confirmed) | Estimate with AWS's "up to 70 %" discount below; check billed Spot usage in the cost estimate (Phase 11) |
+
+**Cost effect** (on-demand ARM price per task = 0.25 × 0.03238 + 0.5 × 0.00356 = **$0.0099/h**;
+Spot assumed 70 % cheaper ≈ $0.0030/h)
+
+| Tasks | All FARGATE | FARGATE base 1 + SPOT weight 3 | Saving |
+|---|---|---|---|
+| 2 | $0.0198/h | 1 × 0.0099 + 1 × 0.0030 = $0.0129/h | 35 % |
+| 6 | $0.0594/h | 2 × 0.0099 + 4 × 0.0030 = $0.0318/h | 46 % |
+
+The saving grows with scale, because the on-demand base stays at one task. At this project's
+size the absolute amount is small (under $0.01/h at 2 tasks); the endpoints and the ALB dominate
+the bill.
+
 ## Repository layout
 
 ```
@@ -869,3 +965,9 @@ scripts/push_image.sh      # build arm64 image, tag with the git SHA, push to EC
 - **"Serverless containers" also simplified the network bill:** Fargate removed the ASG, the AMI,
   the instance role, the ENI-per-host limit that complicated AZ spreading in Phase 4, *and* three
   interface endpoints.
+- **Spot is safe when the shutdown path is fast:** the 30-second ALB drain from Phase 4 and
+  uvicorn's immediate `SIGTERM` handling fit easily into the 2-minute Spot warning. A default
+  300-second deregistration delay would not.
+- **Keep an on-demand floor:** Fargate doesn't fall back to on-demand when Spot capacity is gone,
+  and a stopped task was only replaced after it had fully stopped (~2 min). `Base: 1` on
+  `FARGATE` is what keeps the service up through that.
