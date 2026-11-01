@@ -13,6 +13,7 @@ from psycopg_pool import ConnectionPool, PoolTimeout
 
 from .config import load_settings
 from .repository import ProductRepository
+from .tracing import setup_tracing
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("product_service")
@@ -33,6 +34,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Product Service", version=settings.app_version, lifespan=lifespan)
+# Before the lifespan runs, so the DB pool's connections are instrumented too
+setup_tracing(app, settings.app_version)
 
 
 def get_repository(request: Request) -> ProductRepository:

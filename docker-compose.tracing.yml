@@ -1,0 +1,28 @@
+# Optional local tracing check: app -> ADOT collector (prints spans with the debug exporter).
+#   docker compose -f docker-compose.yml -f docker-compose.tracing.yml up --build -d
+#   curl localhost:3000/products; docker compose logs otel-collector
+services:
+  otel-collector:
+    image: public.ecr.aws/aws-observability/aws-otel-collector:v0.51.0
+    command: ["--config=env:AOT_CONFIG_CONTENT"]
+    environment:
+      AOT_CONFIG_CONTENT: |
+        receivers:
+          otlp:
+            protocols:
+              http:
+                endpoint: 0.0.0.0:4318
+        exporters:
+          debug:
+            verbosity: normal
+        service:
+          pipelines:
+            traces:
+              receivers: [otlp]
+              exporters: [debug]
+
+  product-service:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    depends_on:
+      otel-collector: { condition: service_started }
