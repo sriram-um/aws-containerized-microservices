@@ -24,8 +24,8 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 | 2 | Push image to registry | Amazon ECR | ✅ Done |
 | 3 | Deploy container as a task | Amazon ECS (EC2), VPC, RDS | ✅ Done |
 | 4 | Scale with an ECS Service | ECS Service, ALB, Auto Scaling | ✅ Done |
-| 5 | Monitoring | CloudWatch, Container Insights, X-Ray | ⏳ Next |
-| 6 | CI/CD pipeline | CodePipeline, CodeBuild, CodeDeploy (blue/green) | ⬜ |
+| 5 | Monitoring | CloudWatch, Container Insights, X-Ray | ✅ Done |
+| 6 | CI/CD pipeline | CodePipeline, CodeBuild, CodeDeploy (blue/green) | ⏳ Next |
 | 7 | Replace EC2 with Fargate | AWS Fargate | ⬜ |
 | 8 | Spot capacity | Fargate Spot capacity providers | ⬜ |
 | 9 | Database credentials | AWS Secrets Manager | ⬜ |
@@ -474,17 +474,118 @@ alarm evaluation (3 × 1-minute datapoints above 60 %), not ECS. Scale-in is slo
 - Auto Scaling group: https://us-east-1.console.aws.amazon.com/ec2/home?region=us-east-1#AutoScalingGroups:
 - API: `http://containerized-microservices-alb-2083672321.us-east-1.elb.amazonaws.com/products` (only while `EnableCompute=true`)
 
+### Phase 5 — Monitoring: CloudWatch dashboard, Container Insights, X-Ray (2026-11-01)
+
+**Interpreting the exercise:** the sheet's text lists "Lambda Invocations, Errors" and "X-Ray on
+the Lambda function", copied from the serverless sheet; this architecture has no Lambda. The
+container equivalents were agreed up front: ECS + ALB + RDS metrics, and X-Ray for the service.
+
+**Observability after this phase**
+
+```
+ ALB ──► task (awsvpc ENI) ─────────────────────────────────────────────┐
+         ├─ product-service (FastAPI + OpenTelemetry SDK, sample 10 %)  │
+         │      │ OTLP/HTTP 127.0.0.1:4318                              │
+         │      ▼                                                       │
+         └─ aws-otel-collector (ADOT v0.51.0 sidecar, not essential)    │
+                │ awsxray exporter ─► xray VPC endpoint ─► X-Ray ─► Transaction Search (log group aws/spans)
+ ECS / Container Insights / ALB / ASG / RDS metrics ─► CloudWatch dashboard containerized-microservices-dashboard
+```
+
+**What was added**
+
+| Area | Change | Notes |
+|---|---|---|
+| Cluster | `containerInsights: enabled` | Adds `DesiredTaskCount` / `RunningTaskCount` / `PendingTaskCount` (namespace `ECS/ContainerInsights`). `CPUReservation` / `MemoryReservation` are standard `AWS/ECS` cluster metrics for EC2 |
+| ASG | `MetricsCollection` 1-minute group metrics | Free; dashboard shows hosts in service |
+| App ([`tracing.py`](services/product-service/product_service/tracing.py)) | OpenTelemetry SDK + FastAPI and psycopg instrumentation, X-Ray trace-id generator, `TraceIdRatioBased` sampler, OTLP/HTTP exporter | Only active when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, so local runs and tests are unchanged. `/health` and the ASGI send/receive spans are excluded: **2 spans per request** (server + SQL) |
+| Task definition | Sidecar `aws-otel-collector` (64 CPU units, 128 MiB hard / 64 MiB soft, `Essential: false`, `/healthcheck` health check). The config is inline in `AOT_CONFIG_CONTENT`: OTLP receiver on localhost → batch → `awsxray` exporter. App `DependsOn` sidecar `START` | If the collector dies, the API keeps serving and only traces are lost |
+| `AWS::ECR::PullThroughCacheRule` | prefix `ecr-public` → `public.ecr.aws` | The tasks have no internet route; the cache serves `public.ecr.aws/aws-observability/aws-otel-collector` through the private ECR endpoints. The first pull creates the repository `ecr-public/aws-observability/aws-otel-collector` |
+| IAM | Execution role: pull + `ecr:CreateRepository` / `ecr:BatchImportUpstreamImage` on `repository/ecr-public/aws-observability/*` only. Task role: the 5 X-Ray write actions (X-Ray has no resource-level scoping) | |
+| `XRayEndpoint` | Interface endpoint `com.amazonaws.us-east-1.xray` (`EnableCompute`) | +$0.02/h |
+| `Dashboard` | 7 metric widgets + 1 text widget (below) | Sparse ALB error counts use `FILL(m, 0)` (Project 4 lesson) |
+| Parameters | `AdotCollectorVersion` (`v0.51.0`, same digest as `latest`, multi-arch), `TraceSampleRatio` (`0.1`) | |
+| Local | [`docker-compose.tracing.yml`](docker-compose.tracing.yml): app + ADOT collector with the `debug` exporter | Spans checked locally before deploying |
+| Image | `dcac7a8`: 58.2 MB amd64 / 60.1 MB arm64 (+4 MB for OpenTelemetry) | Cold arm64 build under QEMU: 365 s |
+
+**Dashboard** ([console](https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards/dashboard/containerized-microservices-dashboard)),
+rendered with [`scripts/check_dashboard.py`](scripts/check_dashboard.py) `--images` after a 60 s,
+8-connection load:
+
+| | |
+|---|---|
+| ![ECS cluster CPUReservation, MemoryReservation and utilization](docs/images/dashboard-ecs-cluster-reservation-and-utilization.png) | ![Service desired, running and pending task counts from Container Insights](docs/images/dashboard-service-tasks-desired-running-pending.png) |
+| ![Service CPU and memory utilization with the 60 % scaling target](docs/images/dashboard-service-cpu-memory-utilization-scaling-target-60.png) | ![ALB request count with target 4XX/5XX and ELB 5XX counts](docs/images/dashboard-alb-requests-and-errors-per-minute.png) |
+| ![ALB target response time p50, p90, p99](docs/images/dashboard-alb-target-response-time-seconds.png) | ![Healthy targets, EC2 hosts in service and capacity provider reservation](docs/images/dashboard-capacity-healthy-targets-ec2-hosts-capacity-provider-reserva.png) |
+| ![RDS CPU utilization and database connections](docs/images/dashboard-rds-postgresql-cpu-and-connections.png) | |
+
+The reservation numbers can be checked by hand: 2 tasks × 256 CPU units / (2 hosts × 2048) =
+12.5 % CPU reserved; 2 × 512 MiB / (2 × 1846 MiB) = 28 % memory. The check script found data for
+every metric except `HTTPCode_Target_5XX` and `HTTPCode_ELB_5XX`: there were none.
+
+**Commands run**
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.tracing.yml up --build -d   # local span check
+scripts/push_image.sh                                    # dcac7a8
+scripts/deploy.sh ProductServiceImageTag=dcac7a8
+.venv/Scripts/python scripts/load_test.py --concurrency 8 --duration 60
+.venv/Scripts/python scripts/check_dashboard.py 30 --images
+# Logs Insights on log group aws/spans (Transaction Search):
+#   filter name in ["GET /products", "products"]
+#   | stats count(*), count_distinct(traceId), pct(durationNano, 50)/1000000 by name, kind
+```
+
+**Measured**
+
+| What | Result |
+|---|---|
+| Stack update | 477 s, no failures; both tasks `HEALTHY` with 2 healthy containers each, one task per AZ |
+| Pull-through cache | repository `ecr-public/aws-observability/aws-otel-collector` created by the first task's pull |
+| Traffic for the trace test | 11 781 requests in 60 s (laptop p50 35 ms, p95 79 ms) |
+| Traces in `aws/spans` | **966 traces** (8.2 % of requests; configured 10 %) |
+| Server span `GET /products` | p50 **4.7 ms**, p90 29.8 ms, p99 100 ms |
+| SQL span (`SELECT … FROM products`) | p50 **1.4 ms**, p90 2.6 ms, p99 36 ms |
+| X-Ray classic trace summaries | 10. Transaction Search indexes 1 % by default (playbook gotcha); the full data is in `aws/spans` |
+| Container Insights | 32 metrics (cluster, 13 with `ServiceName`, 8 with `TaskDefinitionFamily`) |
+
+The in-app time (4.7 ms) is a small part of the 35 ms the laptop sees. The rest is network
+round-trip from the client to us-east-1 plus the ALB.
+
+**Issues hit and findings**
+
+| Symptom | Cause | Fix / decision |
+|---|---|---|
+| A request with an ALB-style `X-Amzn-Trace-Id: Root=…` started a **new** trace id locally | The AWS propagator continues a trace only when the header has `Parent=`; the ALB sends only `Root=`, and the ALB doesn't send its own segments to X-Ray | Kept the propagator for service-to-service calls (Phase 12); comment corrected |
+| 4 spans per request: server + SQL + 2 × `GET /products http send` | FastAPI instrumentation records ASGI send/receive spans | `exclude_spans=["send", "receive"]` → 2 spans |
+| A parent-based sampler would have dropped every request | The ALB header carries no "Sampled" decision | `TraceIdRatioBased(0.1)` |
+| Logs Insights `MalformedQueryException: unexpected symbol … e6` | Scientific notation isn't supported | `/1000000` |
+| Filtering `aws/spans` on `resource.attributes.service.name` found only server spans | The `awsxray` exporter turns child spans into **subsegments**, which carry no resource attributes (`aws.local.service: UnknownService`) | Expected in the X-Ray model: the segment (server span) has `service.name=product-service`; query by span name/trace id |
+| Resources outside the stack | Created by AWS on first use: the cache repository `ecr-public/aws-observability/aws-otel-collector` and the log group `/aws/ecs/containerinsights/containerized-microservices/performance` | Delete both explicitly at teardown (Phase 13) |
+
+**Running cost added by this phase**
+
+| Item | Cost |
+|---|---|
+| X-Ray interface endpoint (2 AZs) | $0.02/h |
+| Container Insights: 32 metrics × $0.30/month (prorated hourly) | ≈ $0.013/h (≈ $9.60/month 24×7) |
+| Dashboard | $3/month (fixed, while it exists) |
+| Spans (Transaction Search, 10 % sampling) | cents at demo volumes |
+| **Total running with Phase 3-5** | **≈ $0.24/h** |
+
 ## Repository layout
 
 ```
 template.yaml                    CloudFormation: one stack, extended per exercise
-scripts/                         lib.sh (identity guard), deploy.sh, push_image.sh, run_task.sh, load_test.py
-docs/                            load-test CSVs, cost estimate (later)
+scripts/                         lib.sh (identity guard), deploy.sh, push_image.sh, run_task.sh,
+                                 load_test.py, check_dashboard.py
+docs/                            load-test CSVs, dashboard images, cost estimate (later)
 requirements-scripts.txt         boto3 for the scripts
 docker-compose.yml               local Postgres + seed + service
+docker-compose.tracing.yml       optional: local ADOT collector for span checks
 pytest.ini
 services/product-service/
-  product_service/               FastAPI app (main, repository, config, seed)
+  product_service/               FastAPI app (main, repository, config, seed, tracing)
   tests/                         unit tests
   Dockerfile  .dockerignore  requirements.txt  requirements-dev.txt
 ```
@@ -534,3 +635,9 @@ scripts/push_image.sh      # build arm64 image, tag with the git SHA, push to EC
   the ALB's (65 s > 60 s), or a small share of requests fail with 502s that the app never sees.
 - **Let Auto Scaling own `DesiredCount`:** keeping it in the template means every stack update
   quietly undoes scaling.
+- **Check spans locally before paying for them:** a debug-exporter collector in docker compose
+  showed the noisy send/receive spans and the missing trace-id propagation before anything was
+  deployed.
+- **Private subnets need a plan for every third-party image:** the ADOT sidecar only worked
+  through an ECR pull-through cache. Account-level side effects like that (the cache repository,
+  the Container Insights log group) have to go on the teardown list.

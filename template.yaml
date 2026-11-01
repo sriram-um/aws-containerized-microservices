@@ -25,7 +25,7 @@ Parameters:
   ProductServiceImageTag:
     Description: Image tag (git SHA) in the product-service ECR repository
     Type: String
-    Default: adac991
+    Default: dcac7a8
   EcsAmiId:
     Description: ECS-optimized Amazon Linux 2023 arm64 AMI (resolved from the public SSM parameter at deploy time)
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
@@ -34,6 +34,14 @@ Parameters:
     # t4g.small: 2 vCPU / 2 GiB, 3 ENIs -> 2 awsvpc tasks per host (one ENI is the host's own)
     Type: String
     Default: t4g.small
+  AdotCollectorVersion:
+    Description: AWS Distro for OpenTelemetry collector image tag (public.ecr.aws, pulled through the ECR cache)
+    Type: String
+    Default: v0.51.0
+  TraceSampleRatio:
+    Description: Share of requests traced to X-Ray (0.0-1.0)
+    Type: String
+    Default: '0.1'
 
 Conditions:
   ComputeEnabled: !Equals [!Ref EnableCompute, 'true']
@@ -419,6 +427,10 @@ Resources:
     Type: AWS::ECS::Cluster
     Properties:
       ClusterName: !Ref AWS::StackName
+      # Exercise 5: Container Insights (task/service metrics such as DesiredTaskCount, RunningTaskCount)
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
       Tags:
         - Key: project
           Value: containerized-microservices
@@ -493,6 +505,10 @@ Resources:
       # 3 hosts x 2 awsvpc tasks (ENI limit of t4g.small) = room for the service maximum of 6 tasks
       MaxSize: '3'
       HealthCheckType: EC2
+      # Exercise 5: 1-minute group metrics (free) for the dashboard
+      MetricsCollection:
+        - Granularity: 1Minute
+          Metrics: [GroupDesiredCapacity, GroupInServiceInstances]
       Tags:
         - Key: project
           Value: containerized-microservices
@@ -544,12 +560,19 @@ Resources:
                 Resource: '*'
               - Effect: Allow
                 Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability]
-                Resource: !GetAtt ProductServiceRepository.Arn
+                Resource:
+                  - !GetAtt ProductServiceRepository.Arn
+                  # Exercise 5: ADOT collector via the pull-through cache. The first pull creates the
+                  # cache repository and imports the image, which needs the two extra actions.
+                  - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/ecr-public/aws-observability/*
+              - Effect: Allow
+                Action: [ecr:CreateRepository, ecr:BatchImportUpstreamImage]
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/ecr-public/aws-observability/*
               - Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !GetAtt ProductServiceLogGroup.Arn
 
-  # Task role: AWS permissions for the application itself (none needed yet; X-Ray in exercise 5)
+  # Task role: AWS permissions for the containers themselves (exercise 5: the ADOT collector sends traces)
   ProductServiceTaskRole:
     Type: AWS::IAM::Role
     Properties:
@@ -562,6 +585,20 @@ Resources:
             Condition:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: xray-write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                # Same actions as the AWS-managed AWSXRayDaemonWriteAccess; X-Ray doesn't support resource scoping
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                  - xray:GetSamplingStatisticSummaries
+                Resource: '*'
 
   ProductServiceLogGroup:
     Type: AWS::Logs::LogGroup
@@ -603,6 +640,12 @@ Resources:
             - { Name: DB_PASSWORD, Value: !Ref DBPassword }
             - { Name: DB_SSLMODE, Value: require }
             - { Name: APP_VERSION, Value: !Ref ProductServiceImageTag }
+            # Exercise 5: OpenTelemetry -> ADOT sidecar (same network namespace in awsvpc)
+            - { Name: OTEL_EXPORTER_OTLP_ENDPOINT, Value: 'http://127.0.0.1:4318' }
+            - { Name: TRACE_SAMPLE_RATIO, Value: !Ref TraceSampleRatio }
+          DependsOn:
+            - ContainerName: aws-otel-collector
+              Condition: START
           # ECS ignores the Dockerfile HEALTHCHECK; this is the same check
           HealthCheck:
             Command:
@@ -621,6 +664,71 @@ Resources:
               awslogs-group: !Ref ProductServiceLogGroup
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: product-service
+        # Exercise 5: ADOT collector sidecar - receives OTLP from the app, exports to X-Ray.
+        # Not essential: if it fails, the API keeps serving (only traces are lost).
+        - Name: aws-otel-collector
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/ecr-public/aws-observability/aws-otel-collector:${AdotCollectorVersion}'
+          Essential: false
+          Cpu: 64
+          Memory: 128
+          MemoryReservation: 64
+          Command: ['--config=env:AOT_CONFIG_CONTENT']
+          Environment:
+            - Name: AOT_CONFIG_CONTENT
+              Value: !Sub |
+                extensions:
+                  health_check:
+                    endpoint: 127.0.0.1:13133
+                receivers:
+                  otlp:
+                    protocols:
+                      http:
+                        endpoint: 127.0.0.1:4318
+                processors:
+                  batch/traces:
+                    timeout: 1s
+                    send_batch_size: 50
+                exporters:
+                  awsxray:
+                    region: ${AWS::Region}
+                service:
+                  extensions: [health_check]
+                  pipelines:
+                    traces:
+                      receivers: [otlp]
+                      processors: [batch/traces]
+                      exporters: [awsxray]
+          HealthCheck:
+            Command: [CMD, /healthcheck]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ProductServiceLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: product-service
+
+  # Exercise 5: ECR pull-through cache for ECR Public. Tasks in the private subnets can't reach
+  # public.ecr.aws; the cache serves the image through the private ECR endpoints instead.
+  EcrPublicPullThroughCache:
+    Type: AWS::ECR::PullThroughCacheRule
+    Properties:
+      EcrRepositoryPrefix: ecr-public
+      UpstreamRegistryUrl: public.ecr.aws
+
+  XRayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ComputeEnabled
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.xray
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
 
   # ---------------------------------------------------------------------------
   # Exercise 4: ECS Service behind an Application Load Balancer, with Auto Scaling
@@ -716,7 +824,8 @@ Resources:
     Condition: ComputeEnabled
     # The listener must exist before the service registers targets; the capacity provider
     # must be associated with the cluster before the service can use it
-    DependsOn: [HttpListener, ClusterCapacityProviders]
+    # ...and the sidecar image/traces need the pull-through cache rule and the X-Ray endpoint
+    DependsOn: [HttpListener, ClusterCapacityProviders, EcrPublicPullThroughCache, XRayEndpoint]
     Properties:
       ServiceName: product-service
       Cluster: !Ref Cluster
@@ -787,6 +896,92 @@ Resources:
         ScaleOutCooldown: 60
         ScaleInCooldown: 120
 
+  # ---------------------------------------------------------------------------
+  # Exercise 5: CloudWatch dashboard (~$3/month). Sparse ALB error counts are wrapped in
+  # FILL(m, 0) so idle periods show 0 instead of a gap or a straight line.
+  # ---------------------------------------------------------------------------
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: ComputeEnabled
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-dashboard'
+      DashboardBody: !Sub
+        - |
+          {
+            "start": "-PT3H",
+            "widgets": [
+              {"type": "metric", "x": 0, "y": 0, "width": 8, "height": 6, "properties": {
+                "title": "ECS cluster - reservation and utilization (%)", "region": "${AWS::Region}",
+                "view": "timeSeries", "stat": "Average", "period": 60, "yAxis": {"left": {"min": 0, "max": 100}},
+                "metrics": [
+                  ["AWS/ECS", "CPUReservation", "ClusterName", "${Cluster}", {"label": "CPUReservation"}],
+                  [".", "MemoryReservation", ".", ".", {"label": "MemoryReservation"}],
+                  [".", "CPUUtilization", ".", ".", {"label": "CPUUtilization (cluster)"}],
+                  [".", "MemoryUtilization", ".", ".", {"label": "MemoryUtilization (cluster)"}]
+                ]}},
+              {"type": "metric", "x": 8, "y": 0, "width": 8, "height": 6, "properties": {
+                "title": "Service tasks - desired / running / pending", "region": "${AWS::Region}",
+                "view": "timeSeries", "stat": "Average", "period": 60, "yAxis": {"left": {"min": 0}},
+                "metrics": [
+                  ["ECS/ContainerInsights", "DesiredTaskCount", "ClusterName", "${Cluster}", "ServiceName", "${ServiceName}", {"label": "DesiredTaskCount"}],
+                  [".", "RunningTaskCount", ".", ".", ".", ".", {"label": "RunningTaskCount"}],
+                  [".", "PendingTaskCount", ".", ".", ".", ".", {"label": "PendingTaskCount"}]
+                ]}},
+              {"type": "metric", "x": 16, "y": 0, "width": 8, "height": 6, "properties": {
+                "title": "Service CPU / memory utilization (%) - scaling target 60 %", "region": "${AWS::Region}",
+                "view": "timeSeries", "stat": "Average", "period": 60, "yAxis": {"left": {"min": 0}},
+                "annotations": {"horizontal": [{"label": "CPU target", "value": 60}]},
+                "metrics": [
+                  ["AWS/ECS", "CPUUtilization", "ClusterName", "${Cluster}", "ServiceName", "${ServiceName}", {"label": "CPUUtilization"}],
+                  [".", "MemoryUtilization", ".", ".", ".", ".", {"label": "MemoryUtilization"}]
+                ]}},
+              {"type": "metric", "x": 0, "y": 6, "width": 8, "height": 6, "properties": {
+                "title": "ALB - requests and errors (per minute)", "region": "${AWS::Region}",
+                "view": "timeSeries", "period": 60, "yAxis": {"left": {"min": 0}},
+                "metrics": [
+                  ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${AlbName}", {"stat": "Sum", "label": "RequestCount"}],
+                  [{"expression": "FILL(m4xx, 0)", "label": "HTTPCode_Target_4XX_Count", "id": "e4xx"}],
+                  [{"expression": "FILL(m5xx, 0)", "label": "HTTPCode_Target_5XX_Count", "id": "e5xx"}],
+                  [{"expression": "FILL(melb5xx, 0)", "label": "HTTPCode_ELB_5XX_Count", "id": "eelb5xx"}],
+                  ["AWS/ApplicationELB", "HTTPCode_Target_4XX_Count", "LoadBalancer", "${AlbName}", {"stat": "Sum", "id": "m4xx", "visible": false}],
+                  [".", "HTTPCode_Target_5XX_Count", ".", ".", {"stat": "Sum", "id": "m5xx", "visible": false}],
+                  [".", "HTTPCode_ELB_5XX_Count", ".", ".", {"stat": "Sum", "id": "melb5xx", "visible": false}]
+                ]}},
+              {"type": "metric", "x": 8, "y": 6, "width": 8, "height": 6, "properties": {
+                "title": "ALB - target response time (seconds)", "region": "${AWS::Region}",
+                "view": "timeSeries", "period": 60, "yAxis": {"left": {"min": 0}},
+                "metrics": [
+                  ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${AlbName}", {"stat": "p50", "label": "p50"}],
+                  ["...", {"stat": "p90", "label": "p90"}],
+                  ["...", {"stat": "p99", "label": "p99"}]
+                ]}},
+              {"type": "metric", "x": 16, "y": 6, "width": 8, "height": 6, "properties": {
+                "title": "Capacity - healthy targets, EC2 hosts, capacity provider reservation", "region": "${AWS::Region}",
+                "view": "timeSeries", "period": 60, "stat": "Average", "yAxis": {"left": {"min": 0}, "right": {"min": 0}},
+                "metrics": [
+                  ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${TargetGroupName}", "LoadBalancer", "${AlbName}", {"label": "Healthy targets"}],
+                  [".", "UnHealthyHostCount", ".", ".", ".", ".", {"label": "Unhealthy targets"}],
+                  ["AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "${AsgName}", {"label": "EC2 hosts in service"}],
+                  ["AWS/ECS/ManagedScaling", "CapacityProviderReservation", "CapacityProviderName", "${CapacityProvider}", "ClusterName", "${Cluster}", {"label": "CapacityProviderReservation (%)", "yAxis": "right"}]
+                ]}},
+              {"type": "metric", "x": 0, "y": 12, "width": 12, "height": 6, "properties": {
+                "title": "RDS PostgreSQL - CPU (%) and connections", "region": "${AWS::Region}",
+                "view": "timeSeries", "stat": "Average", "period": 60, "yAxis": {"left": {"min": 0}, "right": {"min": 0}},
+                "metrics": [
+                  ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${AWS::StackName}-products", {"label": "CPUUtilization"}],
+                  [".", "DatabaseConnections", ".", ".", {"label": "DatabaseConnections", "yAxis": "right"}]
+                ]}},
+              {"type": "text", "x": 12, "y": 12, "width": 12, "height": 6, "properties": {
+                "markdown": "## Product Service (ECS on EC2)\n* **Traces:** X-Ray via the ADOT collector sidecar, sampling ${TraceSampleRatio}. This account uses CloudWatch Transaction Search: spans are in the log group `aws/spans`.\n* **Logs:** `/ecs/${AWS::StackName}/product-service`\n* **Scaling:** CPU target 60 %, 2-6 tasks; ASG 2-3 t4g.small hosts\n* **RDS widget** is empty while `EnableDatabase=false`."
+              }}
+            ]
+          }
+        - ServiceName: !GetAtt ProductService.Name
+          AlbName: !GetAtt LoadBalancer.LoadBalancerFullName
+          TargetGroupName: !GetAtt ProductServiceTargetGroup.TargetGroupFullName
+          AsgName: !Ref ContainerInstanceAutoScalingGroup
+          CapacityProvider: !Ref Ec2CapacityProvider
+
 Outputs:
   ProductServiceRepositoryUri:
     Description: Image URI prefix for docker tag/push
@@ -826,3 +1021,6 @@ Outputs:
   AutoScalingGroupName:
     Condition: ComputeEnabled
     Value: !Ref ContainerInstanceAutoScalingGroup
+  DashboardUrl:
+    Condition: ComputeEnabled
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${AWS::StackName}-dashboard'
