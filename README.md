@@ -25,8 +25,8 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 | 3 | Deploy container as a task | Amazon ECS (EC2), VPC, RDS | ✅ Done |
 | 4 | Scale with an ECS Service | ECS Service, ALB, Auto Scaling | ✅ Done |
 | 5 | Monitoring | CloudWatch, Container Insights, X-Ray | ✅ Done |
-| 6 | CI/CD pipeline | CodePipeline, CodeBuild, CodeDeploy (blue/green) | 🟡 Done; push trigger open (manual start works) |
-| 7 | Replace EC2 with Fargate | AWS Fargate | ⬜ |
+| 6 | CI/CD pipeline | CodePipeline, CodeBuild, CodeDeploy (blue/green) | ✅ Done |
+| 7 | Replace EC2 with Fargate | AWS Fargate | ⏳ Next |
 | 8 | Spot capacity | Fargate Spot capacity providers | ⬜ |
 | 9 | Database credentials | AWS Secrets Manager | ⬜ |
 | 10 | Disaster recovery | Aurora Global Database | ⬜ |
@@ -640,7 +640,7 @@ round-trip from the client to us-east-1 plus the ALB.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `Templates with a size greater than 51,200 bytes must be deployed via an S3 Bucket` | The template grew to 58 KB | Bootstrap stack `containerized-microservices-deploy-bucket`; `deploy.sh --s3-bucket` |
-| **Pushes to GitHub don't start the pipeline** (4 pushes, waited 4-5 min each); manual runs work | Not the file-path filter: removing it changed nothing. Re-saving the pipeline didn't help either. The connection can *read* the repo (Source succeeds), but push events don't arrive | **Open** - see "Open item" below. Meanwhile runs are started with `aws codepipeline start-pipeline-execution` |
+| **Pushes to GitHub don't start the pipeline** (4 pushes, waited 4-5 min each); manual runs work | Not the file-path filter: removing it changed nothing. Re-saving the pipeline didn't help either. The connection can *read* the repo (Source succeeds), but push events don't arrive | **Fixed**: the connection was linked to a GitHub App installation on another account - see "Push trigger" below |
 | Test 1 never reached CodeDeploy | `ECS_CONTAINER_METADATA_URI_V4` is also set inside CodeBuild (it runs on ECS) | Keyed the demo on a variable only our task definition sets |
 | Unhealthy-target alarms can't catch a release that fails its health check | Green targets are unused (no listener) until after Install | Expected CodeDeploy behaviour: such a release never receives traffic; stop it manually (or rely on the timeout). The alarms protect after the traffic shift |
 | All-at-once exposed 100 % of users to a bad release for ~3.5 min | ALB metrics are 1-minute datapoints plus publishing delay; detection can't be much faster | `ECSCanary10Percent5Minutes`; measured blast radius 10.1 % |
@@ -648,9 +648,18 @@ round-trip from the client to us-east-1 plus the ALB.
 | `git reset --hard` during the clean-up discarded an uncommitted template change | My mistake | Re-applied (the stack already had it); commit infrastructure changes before git surgery |
 | Live pipeline drifted after the trigger experiment; a CloudFormation deploy didn't fix it | CloudFormation only updates resources whose *template* changed | Restored with `update-pipeline`; `detect-stack-resource-drift` → `IN_SYNC` |
 
-**Open item: push trigger.** The connection is AVAILABLE and the Source stage can read the repository.
-The most likely remaining cause is the GitHub side: push events come from the **AWS Connector for
-GitHub** app *installation*, and only for the repositories that installation can access.
+**Push trigger: root cause and fix.** GitHub showed the **AWS Connector for GitHub** app installed
+on two *other* accounts (`awsfundamentals-hq`, `Shravanthi-J`) but **not on `sriram-um`**, which
+owns the repository. During the console handshake the connection had been linked to one of those
+installations. Source downloads still worked (the repository is public and the user authorization
+can read it), but push events are only sent by an installation on the repository owner's account.
+
+A connection can't be moved to another installation, so the connection was **replaced**
+(`ConnectionName: containerized-ms-github`; CloudFormation created the new one, updated the
+pipeline and deleted the old one). The app was installed on `sriram-um` for this repository only,
+and the new connection authorized with that installation. Result: the next push
+(`c3e0153`) started the pipeline **11 s** later, trigger type `WebhookV2` / `PUSH_BRANCH`. A
+README-only push afterwards did not start it (file-path filter working).
 
 **Costs**
 
