@@ -26,8 +26,8 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 | 4 | Scale with an ECS Service | ECS Service, ALB, Auto Scaling | ✅ Done |
 | 5 | Monitoring | CloudWatch, Container Insights, X-Ray | ✅ Done |
 | 6 | CI/CD pipeline | CodePipeline, CodeBuild, CodeDeploy (blue/green) | ✅ Done |
-| 7 | Replace EC2 with Fargate | AWS Fargate | ⏳ Next |
-| 8 | Spot capacity | Fargate Spot capacity providers | ⬜ |
+| 7 | Replace EC2 with Fargate | AWS Fargate | ✅ Done |
+| 8 | Spot capacity | Fargate Spot capacity providers | ⏳ Next |
 | 9 | Database credentials | AWS Secrets Manager | ⬜ |
 | 10 | Disaster recovery | Aurora Global Database | ⬜ |
 | 11 | Cost estimate | AWS Pricing Calculator | ⬜ |
@@ -676,6 +676,114 @@ README-only push afterwards did not start it (file-path filter working).
 - CodeBuild: https://us-east-1.console.aws.amazon.com/codesuite/codebuild/projects/containerized-microservices-product-service/history?region=us-east-1
 - Connection: https://us-east-1.console.aws.amazon.com/codesuite/settings/connections?region=us-east-1
 
+### Phase 7 — Replace EC2 with AWS Fargate (2026-11-01)
+
+**The constraint:** since Phase 6 the service uses the `CODE_DEPLOY` controller, and `UpdateService`
+can't change its capacity provider strategy (only desired count, deployment configuration, health
+check grace period, placement and tags). So "change the launch type" means **a new service**. A
+CloudFormation replacement would also break: same `ServiceName`, and the listener points at the
+target group CodeDeploy last switched to, not necessarily the one in the template.
+
+**Migration in three deploys, without downtime**
+
+```
+ Deploy A  ALB :80 ─► target group 2 ─┬─ product-service  (EC2, 2 tasks)      ← existing
+                                      └─ product-api      (Fargate, 2 tasks)  ← new, same target group
+ Deploy B  ALB :80 ─► target group 2 ─── product-api (Fargate)   EC2 service + its deployment group removed;
+                                                                 CodeDeploy group product-api, pipeline repointed
+ Deploy C  EC2 capacity provider, ASG, launch template, instance role, host SG and
+           the ecs / ecs-agent / ecs-telemetry endpoints removed; task definition FARGATE-only
+```
+
+| Deploy | Changes | Duration | Probe (`/products`, 2 req/s) |
+|---|---|---|---|
+| A | Task definition `[EC2, FARGATE]`; cluster capacity providers + `FARGATE`, `FARGATE_SPOT`; new service `product-api` (Fargate, `CODE_DEPLOY`, **registered in target group 2, the one serving production**), its scalable target and CPU policy | 202 s | **274/274 `200`** |
+| B | Old service `product-service`, its scaling and its deployment group removed; new deployment group `product-api`; pipeline Deploy action and pipeline role repointed | 258 s | **360/360 `200`** |
+| C | Cluster: `FARGATE` + `FARGATE_SPOT`, default `FARGATE`; EC2 capacity provider, ASG, launch template, instance role/profile, host security group, 3 interface endpoints removed; task definition `[FARGATE]`; dashboard updated | 463 s | **667/667 `200`** |
+
+Why three deploys and not one: ECS refuses to remove a capacity provider from a cluster while a
+service still uses it, and CloudFormation applies the cluster association *update* before it
+*deletes* the old service. Deploy A passes `ProductServiceImageTag=c3e0153`, the live version, so
+EC2 and Fargate tasks served the same code while they overlapped.
+
+**Key finding: two ECS services can share one target group.** After deploy A, target group 2 had
+4 healthy targets (2 EC2 + 2 Fargate, one of each per AZ) and the ALB spread requests across all
+of them. That made the cut-over a non-event: deploy B just removed the EC2 targets (30 s
+deregistration delay).
+
+**What changed in [`template.yaml`](template.yaml)**
+
+| Area | Before (EC2) | After (Fargate) |
+|---|---|---|
+| Service | `product-service`, EC2 capacity provider, placement spread/binpack | `product-api`, capacity provider `FARGATE`, `PlatformVersion: LATEST` (Fargate places tasks across the subnets' AZs itself) |
+| Task definition | `RequiresCompatibilities: [EC2]` | `[FARGATE]`; nothing else had to change (already `awsvpc`, task-level 0.25 vCPU / 512 MiB, ARM64, execution role) |
+| Capacity | ASG 2-3 × t4g.small, capacity provider managed scaling | none to manage |
+| Interface endpoints | 7 (ecr.api, ecr.dkr, logs, xray, ecs, ecs-agent, ecs-telemetry) | **4** (Fargate's agent doesn't need the ecs endpoints) |
+| Removed resources | — | `Ec2CapacityProvider`, `ContainerInstanceAutoScalingGroup`, `ContainerInstanceLaunchTemplate`, `ContainerInstanceRole`/`Profile`, `ContainerInstanceSecurityGroup`, `EcsEndpoint`, `EcsAgentEndpoint`, `EcsTelemetryEndpoint`, parameters `EcsAmiId`/`EcsInstanceType` |
+| Dashboard | `AWS/ECS` `CPUReservation`/`MemoryReservation` | These metrics exist only for EC2 container instances, so they're replaced by Container Insights `CpuReserved`/`CpuUtilized`/`MemoryReserved`/`MemoryUtilized`. The targets widget now shows **both** blue/green target groups (it showed only target group 1, which may not be the live one) |
+| Scripts | — | `run_task.sh` unchanged (output `CapacityProviderName` = `FARGATE`); `load_test.py` ASG columns optional; `check_dashboard.py --images=<subfolder>` |
+
+**Measured: task start, EC2 vs Fargate**
+
+| | EC2 task (host already running) | Fargate task |
+|---|---|---|
+| created → image pull start | ~12 s | ~11 s |
+| image pull (57 MB) | 1.7 s (layers cached on the host) | 3.7-4.6 s (fresh micro-VM, no cache) |
+| created → running | 22-25 s | 32-35 s |
+| new capacity needed | new EC2 host: ~108 s until launch + boot + agent registration | none |
+
+**Measured: first CodeDeploy blue/green on Fargate** (pipeline run for `9a289d5`)
+
+| Step | Result |
+|---|---|
+| Pipeline total | 850 s: build 61 s, Install **2 min 23 s** (same as EC2), canary 5 min, blue wait 5 min |
+| Task set | revision 13, `FARGATE`, one task per AZ. The appspec has no capacity provider strategy, so the task set uses the cluster default `FARGATE` |
+| Probe | 493 × `200`, 1 × no response (`000` at 17:16:01, 18 s into the canary). The ALB recorded **no** 5xx, 502/504, target connection errors or rejected connections in that window, so the request never got an ALB response; most likely client-side. Not reproducible |
+
+**Measured: auto scaling under load, EC2 (Phase 4) vs Fargate** (same 64 connections from the
+same laptop; [`docs/load-test-phase7-fargate.csv`](docs/load-test-phase7-fargate.csv))
+
+| | EC2 | Fargate |
+|---|---|---|
+| 2 tasks: req/s, p50 | ~260, ~300 ms | **~470, ~125 ms** |
+| Load start → "desired 4" | ~6 min | ~6.4 min (same CloudWatch alarm logic) |
+| "desired 4" → 4 running | 70 s | **68 s** |
+| 4 tasks: req/s, p50 | 450-740, 40-80 ms | **720-870, ~35 ms** |
+| "desired 6" → 6 running | 2 tasks PENDING until a 3rd host was launched (108 s) and registered; ~4 min | **65 s**, no pending wait for capacity |
+| errors | 9 ALB 502s (keep-alive bug, fixed in `adac991`) | **0** in ~400 000 requests |
+
+The same nominal 0.25 vCPU delivered ~1.8× the throughput on Fargate. Possible reasons, **not
+verified**: CPU sharing on the 2-vCPU burstable t4g.small hosts, and the Fargate host platform.
+What is measured: on Fargate the service CPU reached ~96-100 % at ~470 req/s with 2 tasks.
+
+![Service desired, running and pending tasks: 2→4 during the blue/green deployment, then 2→4→6 under load](docs/images/phase7/dashboard-service-tasks-desired-running-pending.png)
+
+![Cluster CPU and memory reserved vs used per task (Container Insights)](docs/images/phase7/dashboard-ecs-cluster-cpu-reserved-vs-used-units-memory-reserved-vs-us.png)
+
+**Issues hit and fixes**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Can't switch the existing service to Fargate | `CODE_DEPLOY` services can't change capacity provider strategy via `UpdateService` | New service + shared target group (above) |
+| Removing the EC2 capacity provider in the same deploy as the old service would fail | Cluster association updated before the old service is deleted ("capacity provider in use") | Separate deploys B and C |
+| New Fargate service would have run an old image | It takes the *latest* task definition revision, which CloudFormation registers with its `ProductServiceImageTag` parameter (still `dcac7a8`) | Passed the live tag `c3e0153` in deploy A |
+| Dashboard reservation widget empty on Fargate | `CPUReservation`/`MemoryReservation` are EC2-only | Container Insights `CpuReserved`/`CpuUtilized`/… |
+| Removing a dashboard text block failed the scripted edit's exact-match check | The YAML holds `\n` escapes inside the JSON string | Matched by line prefix instead; scripted edits assert one exact match before writing |
+
+**Running cost now** (us-east-1 list prices, everything on)
+
+| Item | $/hour |
+|---|---|
+| Fargate 2 × (0.25 vCPU × $0.03238 + 0.5 GB × $0.00356), ARM | 0.020 (was EC2 2 × t4g.small + 60 GB EBS ≈ 0.040) |
+| 4 interface endpoints × 2 AZ × $0.01 | 0.080 (was 7 → 0.140) |
+| ALB | 0.0225 + LCU |
+| RDS db.t4g.micro | 0.016 |
+| Container Insights (~0.30 $/metric-month) | ≈ 0.01 |
+| **Total** | **≈ $0.15/h (was ≈ $0.24/h)** |
+
+The biggest saving is not the compute (-$0.02/h) but the three ECS-agent endpoints (-$0.06/h)
+that only EC2 hosts need.
+
 ## Repository layout
 
 ```
@@ -755,3 +863,9 @@ scripts/push_image.sh      # build arm64 image, tag with the git SHA, push to EC
 - **Test the failure path, not only the happy path:** four deliberate failures found the
   test gate, the Install blind spot, the 3.5-minute exposure and the alarm cooldown that blocks
   the next deployment. None of these showed up in the successful deployment.
+- **Migrations under CodeDeploy are new-service migrations:** with `CODE_DEPLOY`, launch type,
+  network and load-balancer settings are frozen. Two services in one target group turned the
+  EC2 → Fargate move into three uneventful deploys (1 301 probe requests, all `200`).
+- **"Serverless containers" also simplified the network bill:** Fargate removed the ASG, the AMI,
+  the instance role, the ENI-per-host limit that complicated AZ spreading in Phase 4, *and* three
+  interface endpoints.

@@ -5,7 +5,7 @@ the dashboard back, expands CloudWatch's "." / "..." shorthand, and sums each me
 last N minutes. With --images it renders each metric widget with GetMetricWidgetImage into
 docs/images/ for the README. (Adapted from Project 4.)
 
-Usage: .venv/Scripts/python scripts/check_dashboard.py [minutes] [--images]
+Usage: .venv/Scripts/python scripts/check_dashboard.py [minutes] [--images[=<subfolder of docs/images>]]
 Uses the AWS "default" profile (account 977534234172) - never the ambient AWS_PROFILE.
 """
 import json
@@ -42,7 +42,7 @@ def expand(metrics):
     return out
 
 
-def main(minutes=30, images=False):
+def main(minutes=30, images=False, subdir=""):
     session = boto3.Session(profile_name="default", region_name="us-east-1")
     if (arn := session.client("sts").get_caller_identity()["Arn"]) != EXPECTED_ARN:
         sys.exit(f"wrong AWS identity {arn}")
@@ -69,15 +69,17 @@ def main(minutes=30, images=False):
             empty += value is None
             print(f"  {'NO DATA' if value is None else f'{value:>10.1f}'}  {stat:<8} {opts.get('label', metric)}")
         if images:
-            IMAGES.mkdir(parents=True, exist_ok=True)
+            out = IMAGES / subdir
+            out.mkdir(parents=True, exist_ok=True)
             widget_def = {**props, "start": f"-PT{minutes}M", "width": 600, "height": 300}
             png = cw.get_metric_widget_image(MetricWidget=json.dumps(widget_def))["MetricWidgetImage"]
             name = re.sub(r"[^a-z0-9]+", "-", props["title"].lower()).strip("-")[:60]
-            (IMAGES / f"dashboard-{name}.png").write_bytes(png)
+            (out / f"dashboard-{name}.png").write_bytes(png)
     print(f"\n{empty} metric(s) without data in the last {minutes} min")
 
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    main(int(args[0]) if args else 30, "--images" in sys.argv)
+    img = next((a for a in sys.argv if a.startswith("--images")), None)
+    main(int(args[0]) if args else 30, img is not None, img.split("=", 1)[1] if img and "=" in img else "")
