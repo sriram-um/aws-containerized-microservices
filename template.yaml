@@ -1175,7 +1175,9 @@ Resources:
       ApplicationName: !Ref CodeDeployApplication
       DeploymentGroupName: product-service
       ServiceRoleArn: !GetAtt CodeDeployRole.Arn
-      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      # Canary: 10 % of traffic for 5 min, then the rest. With all-at-once, a broken (but healthy)
+      # release served 100 % of requests for 3.5 min until the 5xx alarm fired (README, Phase 6).
+      DeploymentConfigName: CodeDeployDefault.ECSCanary10Percent5Minutes
       DeploymentStyle:
         DeploymentType: BLUE_GREEN
         DeploymentOption: WITH_TRAFFIC_CONTROL

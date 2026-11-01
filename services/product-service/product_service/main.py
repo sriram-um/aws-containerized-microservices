@@ -4,7 +4,6 @@ GET /products  -> products from PostgreSQL (Amazon RDS in AWS)
 GET /health    -> liveness for Docker/ECS/ALB health checks; never touches the database
 """
 import logging
-import os
 from contextlib import asynccontextmanager
 
 import psycopg
@@ -50,10 +49,6 @@ def health():
 
 @app.get("/products")
 def list_products(repo: ProductRepository = Depends(get_repository)):
-    # ROLLBACK DEMO (reverted in the next commit): healthy but broken release - /products fails
-    # only in our ECS task (OTEL_EXPORTER_OTLP_ENDPOINT is set there), so unit tests still pass
-    if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"):
-        return JSONResponse(status_code=500, content={"message": "broken release"})
     try:
         products = repo.list_products()
     except (PoolTimeout, psycopg.OperationalError):
