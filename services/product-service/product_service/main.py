@@ -45,8 +45,9 @@ def get_repository(request: Request) -> ProductRepository:
 
 @app.get("/health")
 def health():
-    # ROLLBACK DEMO (reverted in the next commit): fail only inside ECS, so unit tests still pass
-    if os.environ.get("ECS_CONTAINER_METADATA_URI_V4"):
+    # ROLLBACK DEMO (reverted in the next commit): fail only in our ECS task, so unit tests still pass.
+    # (ECS_CONTAINER_METADATA_URI_V4 didn't work: CodeBuild sets it too, and the test gate stopped it.)
+    if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"):
         return JSONResponse(status_code=500, content={"status": "broken"})
     return {"status": "ok", "app_version": settings.app_version}
 
