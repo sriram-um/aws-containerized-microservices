@@ -5,7 +5,7 @@ Description: >-
 
 Parameters:
   EnableCompute:
-    Description: Hourly-billed compute/network pieces (VPC interface endpoints, ECS EC2 hosts). Off between demos.
+    Description: Hourly-billed pieces (VPC interface endpoints, ALB, Fargate service). Off between demos.
     Type: String
     AllowedValues: ['true', 'false']
     Default: 'false'
@@ -26,14 +26,6 @@ Parameters:
     Description: Image tag (git SHA) in the product-service ECR repository
     Type: String
     Default: dcac7a8
-  EcsAmiId:
-    Description: ECS-optimized Amazon Linux 2023 arm64 AMI (resolved from the public SSM parameter at deploy time)
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id
-  EcsInstanceType:
-    # t4g.small: 2 vCPU / 2 GiB, 3 ENIs -> 2 awsvpc tasks per host (one ENI is the host's own)
-    Type: String
-    Default: t4g.small
   AdotCollectorVersion:
     Description: AWS Distro for OpenTelemetry collector image tag (public.ecr.aws, pulled through the ECR cache)
     Type: String
@@ -270,30 +262,17 @@ Resources:
       Tags:
         - { Key: Name, Value: !Sub '${AWS::StackName}-app' }
 
-  ContainerInstanceSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: ECS container instances (host ENI). No inbound traffic.
-      VpcId: !Ref Vpc
-      Tags:
-        - { Key: Name, Value: !Sub '${AWS::StackName}-ecs-host' }
-
   EndpointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Interface VPC endpoints - HTTPS from tasks and container instances
+      GroupDescription: Interface VPC endpoints - HTTPS from tasks
       VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           SourceSecurityGroupId: !Ref AppSecurityGroup
-          Description: Tasks
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          SourceSecurityGroupId: !Ref ContainerInstanceSecurityGroup
-          Description: ECS agent / Docker on the hosts
+          Description: Tasks (Fargate pulls images and ships logs through the task ENI)
       Tags:
         - { Key: Name, Value: !Sub '${AWS::StackName}-endpoints' }
 
@@ -355,40 +334,6 @@ Resources:
       SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
       SecurityGroupIds: [!Ref EndpointSecurityGroup]
 
-  # ECS agent on EC2 hosts: control plane, agent communication, telemetry
-  EcsEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Condition: ComputeEnabled
-    Properties:
-      VpcId: !Ref Vpc
-      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecs
-      VpcEndpointType: Interface
-      PrivateDnsEnabled: true
-      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
-      SecurityGroupIds: [!Ref EndpointSecurityGroup]
-
-  EcsAgentEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Condition: ComputeEnabled
-    Properties:
-      VpcId: !Ref Vpc
-      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecs-agent
-      VpcEndpointType: Interface
-      PrivateDnsEnabled: true
-      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
-      SecurityGroupIds: [!Ref EndpointSecurityGroup]
-
-  EcsTelemetryEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Condition: ComputeEnabled
-    Properties:
-      VpcId: !Ref Vpc
-      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecs-telemetry
-      VpcEndpointType: Interface
-      PrivateDnsEnabled: true
-      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
-      SecurityGroupIds: [!Ref EndpointSecurityGroup]
-
   # ---------------------------------------------------------------------------
   # Exercise 3: Amazon RDS for PostgreSQL
   # ---------------------------------------------------------------------------
@@ -432,7 +377,7 @@ Resources:
           Value: containerized-microservices
 
   # ---------------------------------------------------------------------------
-  # Exercise 3: Amazon ECS cluster with an EC2 capacity provider
+  # Exercise 3: Amazon ECS cluster (EC2 capacity provider in exercises 3-6; Fargate since exercise 7)
   # ---------------------------------------------------------------------------
   Cluster:
     Type: AWS::ECS::Cluster
@@ -446,105 +391,16 @@ Resources:
         - Key: project
           Value: containerized-microservices
 
-  ContainerInstanceRole:
-    Type: AWS::IAM::Role
-    Condition: ComputeEnabled
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: { Service: ec2.amazonaws.com }
-            Action: sts:AssumeRole
-      # AWS-managed policy for the ECS agent: register the instance, poll for tasks, pull from ECR
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
-
-  ContainerInstanceProfile:
-    Type: AWS::IAM::InstanceProfile
-    Condition: ComputeEnabled
-    Properties:
-      Roles: [!Ref ContainerInstanceRole]
-
-  ContainerInstanceLaunchTemplate:
-    Type: AWS::EC2::LaunchTemplate
-    Condition: ComputeEnabled
-    Properties:
-      LaunchTemplateData:
-        ImageId: !Ref EcsAmiId
-        InstanceType: !Ref EcsInstanceType
-        IamInstanceProfile:
-          Arn: !GetAtt ContainerInstanceProfile.Arn
-        SecurityGroupIds: [!Ref ContainerInstanceSecurityGroup]
-        MetadataOptions:
-          HttpTokens: required          # IMDSv2 only
-          HttpPutResponseHopLimit: 1
-        BlockDeviceMappings:
-          - DeviceName: /dev/xvda
-            Ebs:
-              VolumeSize: 30
-              VolumeType: gp3
-              Encrypted: true
-              DeleteOnTermination: true
-        TagSpecifications:
-          - ResourceType: instance
-            Tags:
-              - { Key: Name, Value: !Sub '${AWS::StackName}-ecs-host' }
-              - { Key: project, Value: containerized-microservices }
-        UserData:
-          Fn::Base64: !Sub |
-            #!/bin/bash
-            cat >> /etc/ecs/ecs.config <<EOF
-            ECS_CLUSTER=${Cluster}
-            ECS_AWSVPC_BLOCK_IMDS=true
-            ECS_ENABLE_CONTAINER_METADATA=true
-            EOF
-
-  ContainerInstanceAutoScalingGroup:
-    Type: AWS::AutoScaling::AutoScalingGroup
-    Condition: ComputeEnabled
-    # The interface endpoints must exist before the ECS agent starts, or registration stalls
-    DependsOn: [EcsEndpoint, EcsAgentEndpoint, EcsTelemetryEndpoint, EcrApiEndpoint, EcrDkrEndpoint, LogsEndpoint]
-    Properties:
-      VPCZoneIdentifier: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
-      LaunchTemplate:
-        LaunchTemplateId: !Ref ContainerInstanceLaunchTemplate
-        Version: !GetAtt ContainerInstanceLaunchTemplate.LatestVersionNumber
-      # 2 = one host per AZ. With 1, the capacity provider never adds a host while tasks still fit,
-      # so the service's AZ "spread" placement had only one AZ to use (both tasks on one host).
-      MinSize: '2'
-      # 3 hosts x 2 awsvpc tasks (ENI limit of t4g.small) = room for the service maximum of 6 tasks
-      MaxSize: '3'
-      HealthCheckType: EC2
-      # Exercise 5: 1-minute group metrics (free) for the dashboard
-      MetricsCollection:
-        - Granularity: 1Minute
-          Metrics: [GroupDesiredCapacity, GroupInServiceInstances]
-      Tags:
-        - Key: project
-          Value: containerized-microservices
-          PropagateAtLaunch: true
-
-  Ec2CapacityProvider:
-    Type: AWS::ECS::CapacityProvider
-    Condition: ComputeEnabled
-    Properties:
-      AutoScalingGroupProvider:
-        AutoScalingGroupArn: !Ref ContainerInstanceAutoScalingGroup
-        ManagedScaling:
-          Status: ENABLED
-          TargetCapacity: 100
-        # DISABLED: managed termination protection would need instance scale-in protection on the ASG
-        ManagedTerminationProtection: DISABLED
-
   ClusterCapacityProviders:
     Type: AWS::ECS::ClusterCapacityProviderAssociations
     Condition: ComputeEnabled
     Properties:
       Cluster: !Ref Cluster
-      CapacityProviders: [!Ref Ec2CapacityProvider]
+      # Exercise 7: Fargate only (the EC2 capacity provider and its Auto Scaling group were removed).
+      # The default strategy also applies to CodeDeploy task sets and run-task.
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
       DefaultCapacityProviderStrategy:
-        - CapacityProvider: !Ref Ec2CapacityProvider
+        - CapacityProvider: FARGATE
           Weight: 1
 
   # Task IAM roles ---------------------------------------------------------------
@@ -624,7 +480,9 @@ Resources:
     Type: AWS::ECS::TaskDefinition
     Properties:
       Family: product-service
-      RequiresCompatibilities: [EC2]
+      # Exercise 7: Fargate only (EC2 + FARGATE while both services overlapped). awsvpc, task-level
+      # CPU/memory and ARM64 were already valid for Fargate.
+      RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc            # each task gets its own ENI and security group
       Cpu: '256'
       Memory: '512'
@@ -830,38 +688,31 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref ProductServiceTargetGroup
 
-  ProductService:
+  # Exercises 4-6: the EC2 service `product-service` (and its scalable target and policy) was
+  # removed in exercise 7 after the Fargate service `product-api` took over its traffic.
+
+  # ---------------------------------------------------------------------------
+  # Exercise 7: Product Service on AWS Fargate
+  # ---------------------------------------------------------------------------
+  # With the CODE_DEPLOY controller, UpdateService can't change the capacity provider strategy,
+  # so Fargate needs a NEW service. It registers in the target group that currently receives
+  # production traffic (CodeDeploy last switched :80 to target group 2), so EC2 and Fargate tasks
+  # serve side by side until the EC2 service is removed - no downtime.
+  ProductApiService:
     Type: AWS::ECS::Service
     Condition: ComputeEnabled
-    # The listener must exist before the service registers targets; the capacity provider
-    # must be associated with the cluster before the service can use it
-    # ...and the sidecar image/traces need the pull-through cache rule and the X-Ray endpoint
-    # ...and (with the family-name reference below) the task definition must exist first
     DependsOn: [HttpListener, ClusterCapacityProviders, EcrPublicPullThroughCache, XRayEndpoint,
                 ProductServiceTaskDefinition]
     Properties:
-      ServiceName: product-service
+      ServiceName: product-api
       Cluster: !Ref Cluster
-      # Family name, not !Ref (= family:revision): resolves to the latest ACTIVE revision at create
-      # time and never changes afterwards. With the CODE_DEPLOY controller (exercise 6), CloudFormation
-      # can't update the task definition of the service - new revisions are deployed by CodeDeploy.
-      TaskDefinition: product-service
-      # No DesiredCount: Service Auto Scaling owns it. With DesiredCount: 2 every stack update reset
-      # a scaled-out service back to 2 tasks. A new service starts at 1 and the scalable target's
-      # MinCapacity raises it to 2.
+      TaskDefinition: product-service   # family name: CloudFormation never updates it (exercise 6)
       CapacityProviderStrategy:
-        - CapacityProvider: !Ref Ec2CapacityProvider
+        - CapacityProvider: FARGATE
           Weight: 1
-      # Exercise 6: CodeDeploy blue/green. From now on the task definition, load balancers and
-      # network configuration of this service only change through CodeDeploy deployments, so
-      # those properties must stay as they are in this template.
+      PlatformVersion: LATEST
       DeploymentController:
         Type: CODE_DEPLOY
-      PlacementStrategies:
-        - Type: spread               # one task per AZ first (high availability)...
-          Field: attribute:ecs.availability-zone
-        - Type: binpack              # ...then fill hosts before the ASG adds another one
-          Field: memory
       NetworkConfiguration:
         AwsvpcConfiguration:
           Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
@@ -870,39 +721,31 @@ Resources:
       LoadBalancers:
         - ContainerName: product-service
           ContainerPort: 3000
-          TargetGroupArn: !Ref ProductServiceTargetGroup
+          TargetGroupArn: !Ref ProductServiceTargetGroupGreen
       HealthCheckGracePeriodSeconds: 30
-      DeploymentConfiguration:
-        # With CODE_DEPLOY these only bound the running tasks while a host is DRAINING. (Exercise 4:
-        # 50/100 kept the AZ spread during rolling deployments.) The circuit breaker and AZ
-        # rebalancing only exist for the ECS controller; CodeDeploy rolls back on alarms instead.
-        MinimumHealthyPercent: 50
-        MaximumPercent: 100
       EnableECSManagedTags: true
       PropagateTags: SERVICE
       Tags:
         - Key: project
           Value: containerized-microservices
 
-  # Service Auto Scaling: target tracking on average CPU (uses the ECS Application Auto Scaling
-  # service-linked role). New tasks that don't fit on the hosts make the capacity provider grow the ASG.
-  ProductServiceScalableTarget:
+  ProductApiScalableTarget:
     Type: AWS::ApplicationAutoScaling::ScalableTarget
     Condition: ComputeEnabled
     Properties:
       ServiceNamespace: ecs
       ScalableDimension: ecs:service:DesiredCount
-      ResourceId: !Sub service/${Cluster}/${ProductService.Name}
+      ResourceId: !Sub service/${Cluster}/${ProductApiService.Name}
       MinCapacity: 2
       MaxCapacity: 6
 
-  ProductServiceCpuScalingPolicy:
+  ProductApiCpuScalingPolicy:
     Type: AWS::ApplicationAutoScaling::ScalingPolicy
     Condition: ComputeEnabled
     Properties:
-      PolicyName: !Sub '${AWS::StackName}-product-cpu60'
+      PolicyName: !Sub '${AWS::StackName}-product-api-cpu60'
       PolicyType: TargetTrackingScaling
-      ScalingTargetId: !Ref ProductServiceScalableTarget
+      ScalingTargetId: !Ref ProductApiScalableTarget
       TargetTrackingScalingPolicyConfiguration:
         PredefinedMetricSpecification:
           PredefinedMetricType: ECSServiceAverageCPUUtilization
@@ -1171,12 +1014,13 @@ Resources:
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
 
-  ProductServiceDeploymentGroup:
+  # Exercise 7: deployment group for the Fargate service (replaced the one for `product-service`)
+  ProductApiDeploymentGroup:
     Type: AWS::CodeDeploy::DeploymentGroup
     Condition: ComputeEnabled
     Properties:
       ApplicationName: !Ref CodeDeployApplication
-      DeploymentGroupName: product-service
+      DeploymentGroupName: product-api
       ServiceRoleArn: !GetAtt CodeDeployRole.Arn
       # Canary: 10 % of traffic for 5 min, then the rest. With all-at-once, a broken (but healthy)
       # release served 100 % of requests for 3.5 min until the 5xx alarm fired (README, Phase 6).
@@ -1193,7 +1037,7 @@ Resources:
           TerminationWaitTimeInMinutes: 5        # blue tasks kept 5 min for an instant rollback
       ECSServices:
         - ClusterName: !Ref Cluster
-          ServiceName: !GetAtt ProductService.Name
+          ServiceName: !GetAtt ProductApiService.Name
       LoadBalancerInfo:
         TargetGroupPairInfoList:
           - TargetGroups:
@@ -1250,7 +1094,7 @@ Resources:
                   - codedeploy:RegisterApplicationRevision
                 Resource:
                   - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${CodeDeployApplication}
-                  - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${CodeDeployApplication}/product-service
+                  - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${CodeDeployApplication}/product-api
               - Effect: Allow
                 Action: codedeploy:GetDeploymentConfig
                 Resource: !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:*
@@ -1314,7 +1158,7 @@ Resources:
               ActionTypeId: { Category: Deploy, Owner: AWS, Provider: CodeDeployToECS, Version: '1' }
               Configuration:
                 ApplicationName: !Ref CodeDeployApplication
-                DeploymentGroupName: !Ref ProductServiceDeploymentGroup
+                DeploymentGroupName: !Ref ProductApiDeploymentGroup
                 TaskDefinitionTemplateArtifact: BuildOutput
                 TaskDefinitionTemplatePath: taskdef.json
                 AppSpecTemplateArtifact: BuildOutput
@@ -1341,13 +1185,13 @@ Resources:
             "start": "-PT3H",
             "widgets": [
               {"type": "metric", "x": 0, "y": 0, "width": 8, "height": 6, "properties": {
-                "title": "ECS cluster - reservation and utilization (%)", "region": "${AWS::Region}",
-                "view": "timeSeries", "stat": "Average", "period": 60, "yAxis": {"left": {"min": 0, "max": 100}},
+                "title": "ECS cluster - CPU reserved vs used (units), memory reserved vs used (MiB)", "region": "${AWS::Region}",
+                "view": "timeSeries", "stat": "Average", "period": 60, "yAxis": {"left": {"min": 0}, "right": {"min": 0}},
                 "metrics": [
-                  ["AWS/ECS", "CPUReservation", "ClusterName", "${Cluster}", {"label": "CPUReservation"}],
-                  [".", "MemoryReservation", ".", ".", {"label": "MemoryReservation"}],
-                  [".", "CPUUtilization", ".", ".", {"label": "CPUUtilization (cluster)"}],
-                  [".", "MemoryUtilization", ".", ".", {"label": "MemoryUtilization (cluster)"}]
+                  ["ECS/ContainerInsights", "CpuReserved", "ClusterName", "${Cluster}", {"label": "CpuReserved"}],
+                  [".", "CpuUtilized", ".", ".", {"label": "CpuUtilized"}],
+                  [".", "MemoryReserved", ".", ".", {"label": "MemoryReserved (MiB)", "yAxis": "right"}],
+                  [".", "MemoryUtilized", ".", ".", {"label": "MemoryUtilized (MiB)", "yAxis": "right"}]
                 ]}},
               {"type": "metric", "x": 8, "y": 0, "width": 8, "height": 6, "properties": {
                 "title": "Service tasks - desired / running / pending", "region": "${AWS::Region}",
@@ -1386,13 +1230,13 @@ Resources:
                   ["...", {"stat": "p99", "label": "p99"}]
                 ]}},
               {"type": "metric", "x": 16, "y": 6, "width": 8, "height": 6, "properties": {
-                "title": "Capacity - healthy targets, EC2 hosts, capacity provider reservation", "region": "${AWS::Region}",
-                "view": "timeSeries", "period": 60, "stat": "Average", "yAxis": {"left": {"min": 0}, "right": {"min": 0}},
+                "title": "Targets - healthy / unhealthy in both blue/green target groups", "region": "${AWS::Region}",
+                "view": "timeSeries", "period": 60, "stat": "Average", "yAxis": {"left": {"min": 0}},
                 "metrics": [
-                  ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${TargetGroupName}", "LoadBalancer", "${AlbName}", {"label": "Healthy targets"}],
-                  [".", "UnHealthyHostCount", ".", ".", ".", ".", {"label": "Unhealthy targets"}],
-                  ["AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "${AsgName}", {"label": "EC2 hosts in service"}],
-                  ["AWS/ECS/ManagedScaling", "CapacityProviderReservation", "CapacityProviderName", "${CapacityProvider}", "ClusterName", "${Cluster}", {"label": "CapacityProviderReservation (%)", "yAxis": "right"}]
+                  ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${TargetGroup1}", "LoadBalancer", "${AlbName}", {"label": "Healthy - target group 1"}],
+                  [".", ".", ".", "${TargetGroup2}", ".", ".", {"label": "Healthy - target group 2"}],
+                  [".", "UnHealthyHostCount", ".", "${TargetGroup1}", ".", ".", {"label": "Unhealthy - target group 1"}],
+                  [".", ".", ".", "${TargetGroup2}", ".", ".", {"label": "Unhealthy - target group 2"}]
                 ]}},
               {"type": "metric", "x": 0, "y": 12, "width": 12, "height": 6, "properties": {
                 "title": "RDS PostgreSQL - CPU (%) and connections", "region": "${AWS::Region}",
@@ -1402,15 +1246,14 @@ Resources:
                   [".", "DatabaseConnections", ".", ".", {"label": "DatabaseConnections", "yAxis": "right"}]
                 ]}},
               {"type": "text", "x": 12, "y": 12, "width": 12, "height": 6, "properties": {
-                "markdown": "## Product Service (ECS on EC2)\n* **Traces:** X-Ray via the ADOT collector sidecar, sampling ${TraceSampleRatio}. This account uses CloudWatch Transaction Search: spans are in the log group `aws/spans`.\n* **Logs:** `/ecs/${AWS::StackName}/product-service`\n* **Scaling:** CPU target 60 %, 2-6 tasks; ASG 2-3 t4g.small hosts\n* **RDS widget** is empty while `EnableDatabase=false`."
+                "markdown": "## Product Service (ECS on Fargate, service product-api)\n* **Deployments:** CodePipeline + CodeDeploy blue/green, canary 10 % / 5 min\n* **Traces:** X-Ray via the ADOT collector sidecar, sampling ${TraceSampleRatio}. This account uses CloudWatch Transaction Search: spans are in the log group `aws/spans`.\n* **Logs:** `/ecs/${AWS::StackName}/product-service`\n* **Scaling:** CPU target 60 %, 2-6 Fargate tasks (0.25 vCPU / 0.5 GB, ARM64)\n* **RDS widget** is empty while `EnableDatabase=false`."
               }}
             ]
           }
-        - ServiceName: !GetAtt ProductService.Name
+        - ServiceName: !GetAtt ProductApiService.Name
           AlbName: !GetAtt LoadBalancer.LoadBalancerFullName
-          TargetGroupName: !GetAtt ProductServiceTargetGroup.TargetGroupFullName
-          AsgName: !Ref ContainerInstanceAutoScalingGroup
-          CapacityProvider: !Ref Ec2CapacityProvider
+          TargetGroup1: !GetAtt ProductServiceTargetGroup.TargetGroupFullName
+          TargetGroup2: !GetAtt ProductServiceTargetGroupGreen.TargetGroupFullName
 
 Outputs:
   ProductServiceRepositoryUri:
@@ -1427,8 +1270,7 @@ Outputs:
   ClusterName:
     Value: !Ref Cluster
   CapacityProviderName:
-    Condition: ComputeEnabled
-    Value: !Ref Ec2CapacityProvider
+    Value: FARGATE
   TaskDefinitionArn:
     Value: !Ref ProductServiceTaskDefinition
   LogGroupName:
@@ -1441,16 +1283,13 @@ Outputs:
     Value: !Sub 'http://${LoadBalancer.DNSName}/products'
   ServiceName:
     Condition: ComputeEnabled
-    Value: !GetAtt ProductService.Name
+    Value: !GetAtt ProductApiService.Name
   LoadBalancerFullName:
     Condition: ComputeEnabled
     Value: !GetAtt LoadBalancer.LoadBalancerFullName
   TargetGroupFullName:
     Condition: ComputeEnabled
     Value: !GetAtt ProductServiceTargetGroup.TargetGroupFullName
-  AutoScalingGroupName:
-    Condition: ComputeEnabled
-    Value: !Ref ContainerInstanceAutoScalingGroup
   GitHubConnectionArn:
     Value: !Ref GitHubConnection
   PipelineName:

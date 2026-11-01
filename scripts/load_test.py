@@ -83,7 +83,8 @@ def main():
     outputs = {o["OutputKey"]: o["OutputValue"] for o in
                session.client("cloudformation").describe_stacks(StackName=STACK)["Stacks"][0]["Outputs"]}
     url = urlparse(outputs["ProductsUrl"])
-    cluster, service, asg_name = outputs["ClusterName"], outputs["ServiceName"], outputs["AutoScalingGroupName"]
+    cluster, service = outputs["ClusterName"], outputs["ServiceName"]
+    asg_name = outputs.get("AutoScalingGroupName")  # EC2 only (exercises 3-6); Fargate has no hosts
     ecs, asg = session.client("ecs"), session.client("autoscaling")
 
     stats, stop = Stats(), threading.Event()
@@ -109,13 +110,16 @@ def main():
             lat, codes, errors = stats.drain()
             ok = sum(v for k, v in codes.items() if 200 <= k < 300)
             svc = ecs.describe_services(cluster=cluster, services=[service])["services"][0]
-            group = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])["AutoScalingGroups"][0]
-            in_service = sum(1 for i in group["Instances"] if i["LifecycleState"] == "InService")
+            asg_desired = in_service = "-"
+            if asg_name:
+                group = asg.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])["AutoScalingGroups"][0]
+                asg_desired = group["DesiredCapacity"]
+                in_service = sum(1 for i in group["Instances"] if i["LifecycleState"] == "InService")
             row = [round(elapsed), "load" if elapsed <= args.duration + args.interval else "idle",
                    round((len(lat) + errors) / args.interval), round(pct(lat, 50), 1), round(pct(lat, 95), 1),
                    ok, sum(codes.values()) - ok, errors,
                    svc["desiredCount"], svc["runningCount"], svc["pendingCount"],
-                   group["DesiredCapacity"], in_service]
+                   asg_desired, in_service]
             writer.writerow(row)
             f.flush()
             print("  ".join(str(v) for v in row), flush=True)
