@@ -4,6 +4,7 @@ GET /products  -> products from PostgreSQL (Amazon RDS in AWS)
 GET /health    -> liveness for Docker/ECS/ALB health checks; never touches the database
 """
 import logging
+import os
 from contextlib import asynccontextmanager
 
 import psycopg
@@ -44,6 +45,9 @@ def get_repository(request: Request) -> ProductRepository:
 
 @app.get("/health")
 def health():
+    # ROLLBACK DEMO (reverted in the next commit): fail only inside ECS, so unit tests still pass
+    if os.environ.get("ECS_CONTAINER_METADATA_URI_V4"):
+        return JSONResponse(status_code=500, content={"status": "broken"})
     return {"status": "ok", "app_version": settings.app_version}
 
 
