@@ -31,4 +31,6 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/health', timeout=2)"]
 # Exec form: uvicorn is PID 1 and receives SIGTERM from ECS for a graceful shutdown.
 # --proxy-headers: trust X-Forwarded-* from the ALB.
-CMD ["uvicorn", "product_service.main:app", "--host", "0.0.0.0", "--port", "3000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# --timeout-keep-alive 65: longer than the ALB idle timeout (60 s). With uvicorn's default of 5 s
+# the app closed idle connections the ALB was about to reuse -> sporadic ALB 502s under load.
+CMD ["uvicorn", "product_service.main:app", "--host", "0.0.0.0", "--port", "3000", "--proxy-headers", "--forwarded-allow-ips", "*", "--timeout-keep-alive", "65"]
