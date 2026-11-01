@@ -1,0 +1,51 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Bootstrap for containerized-microservices: S3 bucket that stages template.yaml for
+  CloudFormation (templates over 51,200 bytes can't be passed inline). Deployed by scripts/deploy.sh.
+
+Resources:
+  TemplateBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-staged-templates
+            Status: Enabled
+            ExpirationInDays: 7
+      Tags:
+        - Key: project
+          Value: containerized-microservices
+
+  TemplateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TemplateBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt TemplateBucket.Arn, !Sub '${TemplateBucket.Arn}/*']
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+Outputs:
+  TemplateBucketName:
+    Value: !Ref TemplateBucket

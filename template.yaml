@@ -42,6 +42,17 @@ Parameters:
     Description: Share of requests traced to X-Ray (0.0-1.0)
     Type: String
     Default: '0.1'
+  GitHubRepository:
+    Description: owner/repo the pipeline builds from
+    Type: String
+    Default: sriram-um/aws-containerized-microservices
+  GitHubBranch:
+    Type: String
+    Default: main
+  TestTrafficCidr:
+    Description: Who may call the blue/green test listener (:8080). Default allows nobody.
+    Type: String
+    Default: 127.0.0.1/32
 
 Conditions:
   ComputeEnabled: !Equals [!Ref EnableCompute, 'true']
@@ -825,20 +836,27 @@ Resources:
     # The listener must exist before the service registers targets; the capacity provider
     # must be associated with the cluster before the service can use it
     # ...and the sidecar image/traces need the pull-through cache rule and the X-Ray endpoint
-    DependsOn: [HttpListener, ClusterCapacityProviders, EcrPublicPullThroughCache, XRayEndpoint]
+    # ...and (with the family-name reference below) the task definition must exist first
+    DependsOn: [HttpListener, ClusterCapacityProviders, EcrPublicPullThroughCache, XRayEndpoint,
+                ProductServiceTaskDefinition]
     Properties:
       ServiceName: product-service
       Cluster: !Ref Cluster
-      TaskDefinition: !Ref ProductServiceTaskDefinition
+      # Family name, not !Ref (= family:revision): resolves to the latest ACTIVE revision at create
+      # time and never changes afterwards. With the CODE_DEPLOY controller (exercise 6), CloudFormation
+      # can't update the task definition of the service - new revisions are deployed by CodeDeploy.
+      TaskDefinition: product-service
       # No DesiredCount: Service Auto Scaling owns it. With DesiredCount: 2 every stack update reset
       # a scaled-out service back to 2 tasks. A new service starts at 1 and the scalable target's
       # MinCapacity raises it to 2.
       CapacityProviderStrategy:
         - CapacityProvider: !Ref Ec2CapacityProvider
           Weight: 1
-      # AZ rebalancing (ENABLED) did not move tasks within 10 min on EC2 (README, Phase 4), and it
-      # isn't supported with MaximumPercent 100 below.
-      AvailabilityZoneRebalancing: DISABLED
+      # Exercise 6: CodeDeploy blue/green. From now on the task definition, load balancers and
+      # network configuration of this service only change through CodeDeploy deployments, so
+      # those properties must stay as they are in this template.
+      DeploymentController:
+        Type: CODE_DEPLOY
       PlacementStrategies:
         - Type: spread               # one task per AZ first (high availability)...
           Field: attribute:ecs.availability-zone
@@ -855,15 +873,11 @@ Resources:
           TargetGroupArn: !Ref ProductServiceTargetGroup
       HealthCheckGracePeriodSeconds: 30
       DeploymentConfiguration:
-        # With 200 % the new tasks start while the old ones hold the hosts' ENI slots (2 per
-        # t4g.small), so all new tasks landed in one AZ. 50/100 replaces one task at a time: the AZ
-        # spread puts each replacement in the AZ that just lost a task. Cost: 1 task serves during
-        # a deployment. (Exercise 6 moves to CodeDeploy blue/green, exercise 7 to Fargate.)
+        # With CODE_DEPLOY these only bound the running tasks while a host is DRAINING. (Exercise 4:
+        # 50/100 kept the AZ spread during rolling deployments.) The circuit breaker and AZ
+        # rebalancing only exist for the ECS controller; CodeDeploy rolls back on alarms instead.
         MinimumHealthyPercent: 50
         MaximumPercent: 100
-        DeploymentCircuitBreaker:
-          Enable: true
-          Rollback: true
       EnableECSManagedTags: true
       PropagateTags: SERVICE
       Tags:
@@ -895,6 +909,417 @@ Resources:
         TargetValue: 60
         ScaleOutCooldown: 60
         ScaleInCooldown: 120
+
+  # ---------------------------------------------------------------------------
+  # Exercise 6: CI/CD - CodePipeline (GitHub) -> CodeBuild -> CodeDeploy ECS blue/green
+  # ---------------------------------------------------------------------------
+  # Blue/green needs a second target group and a test listener. CodeDeploy swaps the listeners'
+  # target groups on every deployment, so HttpListener/TestListener must not be edited in this
+  # template afterwards (a stack update would point them back at the original target groups).
+  ProductServiceTargetGroupGreen:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: ComputeEnabled
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3000
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+
+  AlbTestListenerIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      CidrIp: !Ref TestTrafficCidr
+      Description: Blue/green test listener
+
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: ComputeEnabled
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ProductServiceTargetGroupGreen
+
+  # GitHub connection: created PENDING; the handshake is completed once in the console
+  # (Developer Tools > Settings > Connections). Kept outside the toggle so it never needs re-authorizing.
+  GitHubConnection:
+    Type: AWS::CodeConnections::Connection
+    Properties:
+      ConnectionName: !Sub '${AWS::StackName}-gh'
+      ProviderType: GitHub
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete     # must be emptied before stack deletion (teardown script)
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-pipeline-artifacts
+            Status: Enabled
+            ExpirationInDays: 14
+      Tags:
+        - Key: project
+          Value: containerized-microservices
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt ArtifactBucket.Arn, !Sub '${ArtifactBucket.Arn}/*']
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # CodeBuild -----------------------------------------------------------------
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${AWS::StackName}-product-service
+      RetentionInDays: 14
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Condition: ComputeEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: build-and-push-product-service
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${CodeBuildLogGroup.Arn}'
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken   # account-level action
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:DescribeImages
+                Resource: !GetAtt ProductServiceRepository.Arn
+              - Effect: Allow
+                Action: ecs:DescribeTaskDefinition   # no resource-level permissions for this action
+                Resource: '*'
+
+  ProductServiceBuild:
+    Type: AWS::CodeBuild::Project
+    Condition: ComputeEnabled
+    Properties:
+      Name: !Sub '${AWS::StackName}-product-service'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        # Native arm64 build host (a local arm64 build under QEMU takes ~6 min)
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: true     # docker build
+        EnvironmentVariables:
+          - Name: REPOSITORY_URI
+            Value: !GetAtt ProductServiceRepository.RepositoryUri
+          - Name: TASK_DEFINITION_ARN
+            Value: !Ref ProductServiceTaskDefinition
+      Cache:
+        Type: LOCAL
+        Modes: [LOCAL_DOCKER_LAYER_CACHE, LOCAL_SOURCE_CACHE]
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+      TimeoutInMinutes: 20
+      Tags:
+        - Key: project
+          Value: containerized-microservices
+
+  # CodeDeploy ----------------------------------------------------------------
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Condition: ComputeEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codedeploy.amazonaws.com }
+            Action: sts:AssumeRole
+      # AWS-managed policy for ECS blue/green: task sets, ELB listener/rule changes, alarms
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Condition: ComputeEnabled
+    Properties:
+      ApplicationName: !Sub '${AWS::StackName}-product-service'
+      ComputePlatform: ECS
+
+  # Alarms that stop and roll back a deployment (both target groups: either can be "green")
+  UnhealthyTargetsBlueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ComputeEnabled
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-unhealthy-targets-tg1'
+      AlarmDescription: Unhealthy Product Service targets in target group 1 (rolls back CodeDeploy)
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: TargetGroup, Value: !GetAtt ProductServiceTargetGroup.TargetGroupFullName }
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  UnhealthyTargetsGreenAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ComputeEnabled
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-unhealthy-targets-tg2'
+      AlarmDescription: Unhealthy Product Service targets in target group 2 (rolls back CodeDeploy)
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: TargetGroup, Value: !GetAtt ProductServiceTargetGroupGreen.TargetGroupFullName }
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  Target5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ComputeEnabled
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-target-5xx'
+      AlarmDescription: Product Service returns 5xx (rolls back CodeDeploy)
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ProductServiceDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Condition: ComputeEnabled
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: product-service
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      BlueGreenDeploymentConfiguration:
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT   # shift traffic as soon as the green tasks are healthy
+          WaitTimeInMinutes: 0
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 5        # blue tasks kept 5 min for an instant rollback
+      ECSServices:
+        - ClusterName: !Ref Cluster
+          ServiceName: !GetAtt ProductService.Name
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - TargetGroups:
+              - Name: !GetAtt ProductServiceTargetGroup.TargetGroupName
+              - Name: !GetAtt ProductServiceTargetGroupGreen.TargetGroupName
+            ProdTrafficRoute:
+              ListenerArns: [!Ref HttpListener]
+            TestTrafficRoute:
+              ListenerArns: [!Ref TestListener]
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events: [DEPLOYMENT_FAILURE, DEPLOYMENT_STOP_ON_ALARM, DEPLOYMENT_STOP_ON_REQUEST]
+      AlarmConfiguration:
+        Enabled: true
+        Alarms:
+          - Name: !Ref UnhealthyTargetsBlueAlarm
+          - Name: !Ref UnhealthyTargetsGreenAlarm
+          - Name: !Ref Target5xxAlarm
+
+  # CodePipeline --------------------------------------------------------------
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Condition: ComputeEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: product-service-pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketVersioning]
+                Resource: [!GetAtt ArtifactBucket.Arn, !Sub '${ArtifactBucket.Arn}/*']
+              - Effect: Allow
+                Action: [codeconnections:UseConnection, codestar-connections:UseConnection]
+                Resource: !Ref GitHubConnection
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: !GetAtt ProductServiceBuild.Arn
+              - Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:RegisterApplicationRevision
+                Resource:
+                  - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${CodeDeployApplication}
+                  - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${CodeDeployApplication}/product-service
+              - Effect: Allow
+                Action: codedeploy:GetDeploymentConfig
+                Resource: !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:*
+              - Effect: Allow
+                Action: [ecs:RegisterTaskDefinition, ecs:TagResource]   # no resource-level scoping for register
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt TaskExecutionRole.Arn, !GetAtt ProductServiceTaskRole.Arn]
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Condition: ComputeEnabled
+    Properties:
+      Name: !Sub '${AWS::StackName}-product-service'
+      PipelineType: V2
+      ExecutionMode: QUEUED
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      # Only changes to the service (or the build/deploy files) start the pipeline - README edits don't
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: Source
+            Push:
+              - Branches:
+                  Includes: [!Ref GitHubBranch]
+                FilePaths:
+                  Includes:
+                    - services/product-service/**
+                    - buildspec.yml
+                    - appspec.yaml
+                    - scripts/render_taskdef.py
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: '1' }
+              Configuration:
+                ConnectionArn: !Ref GitHubConnection
+                FullRepositoryId: !Ref GitHubRepository
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts: [{ Name: SourceOutput }]
+        - Name: Build
+          Actions:
+            - Name: TestBuildPush
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: '1' }
+              Configuration:
+                ProjectName: !Ref ProductServiceBuild
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: BuildOutput }]
+        - Name: Deploy
+          Actions:
+            - Name: BlueGreen
+              ActionTypeId: { Category: Deploy, Owner: AWS, Provider: CodeDeployToECS, Version: '1' }
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref ProductServiceDeploymentGroup
+                TaskDefinitionTemplateArtifact: BuildOutput
+                TaskDefinitionTemplatePath: taskdef.json
+                AppSpecTemplateArtifact: BuildOutput
+                AppSpecTemplatePath: appspec.yaml
+                Image1ArtifactName: BuildOutput
+                Image1ContainerName: IMAGE1_NAME
+              InputArtifacts: [{ Name: BuildOutput }]
+      Tags:
+        - Key: project
+          Value: containerized-microservices
 
   # ---------------------------------------------------------------------------
   # Exercise 5: CloudWatch dashboard (~$3/month). Sparse ALB error counts are wrapped in
@@ -1021,6 +1446,16 @@ Outputs:
   AutoScalingGroupName:
     Condition: ComputeEnabled
     Value: !Ref ContainerInstanceAutoScalingGroup
+  GitHubConnectionArn:
+    Value: !Ref GitHubConnection
+  PipelineName:
+    Condition: ComputeEnabled
+    Value: !Ref Pipeline
+  CodeDeployApplicationName:
+    Condition: ComputeEnabled
+    Value: !Ref CodeDeployApplication
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
   DashboardUrl:
     Condition: ComputeEnabled
     Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${AWS::StackName}-dashboard'

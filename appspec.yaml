@@ -1,0 +1,12 @@
+# Exercise 6: CodeDeploy ECS blue/green. The CodeDeployToECS action replaces <TASK_DEFINITION>
+# with the revision it registers from taskdef.json. No capacity provider strategy here: the
+# replacement task set uses the cluster's default strategy (the EC2 capacity provider).
+version: 0.0
+Resources:
+  - TargetService:
+      Type: AWS::ECS::Service
+      Properties:
+        TaskDefinition: <TASK_DEFINITION>
+        LoadBalancerInfo:
+          ContainerName: product-service
+          ContainerPort: 3000

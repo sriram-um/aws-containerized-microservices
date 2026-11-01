@@ -1,0 +1,46 @@
+# Exercise 6: CodeBuild - test, build and push the Product Service image, then produce the
+# CodeDeployToECS inputs (imageDetail.json, taskdef.json, appspec.yaml).
+# REPOSITORY_URI and TASK_DEFINITION_ARN come from the CodeBuild project (template.yaml).
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install --quiet -r services/product-service/requirements-dev.txt
+  pre_build:
+    on-failure: ABORT
+    commands:
+      - python -m pytest -q
+      - TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:7}
+      - IMAGE_URI=$REPOSITORY_URI:$TAG
+      - aws ecr get-login-password | docker login --username AWS --password-stdin ${REPOSITORY_URI%%/*}
+  build:
+    on-failure: ABORT
+    commands:
+      # Tags are immutable: a re-run for the same commit reuses the image that is already in ECR
+      - |
+        if aws ecr describe-images --repository-name ${REPOSITORY_URI##*/} --image-ids imageTag=$TAG >/dev/null 2>&1; then
+          echo "Image $TAG already in ECR - skipping docker build"
+        else
+          docker build -t $IMAGE_URI services/product-service
+          docker push $IMAGE_URI
+        fi
+  post_build:
+    on-failure: ABORT
+    commands:
+      - printf '{"ImageURI":"%s"}' "$IMAGE_URI" > imageDetail.json
+      # The task definition CloudFormation registered (roles, sidecar, env) with only the image swapped
+      - aws ecs describe-task-definition --task-definition "$TASK_DEFINITION_ARN" --query taskDefinition > td.json
+      - python scripts/render_taskdef.py td.json $TAG > taskdef.json
+      - cat imageDetail.json
+
+artifacts:
+  files:
+    - imageDetail.json
+    - taskdef.json
+    - appspec.yaml

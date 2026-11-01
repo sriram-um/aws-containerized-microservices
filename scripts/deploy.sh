@@ -9,7 +9,18 @@ cd "$REPO_ROOT"
 .venv/Scripts/cfn-lint template.yaml
 echo "cfn-lint OK"
 
+# Templates over 51,200 bytes must be staged in S3: bootstrap stack with the staging bucket
+BOOTSTRAP_STACK="$STACK_NAME-deploy-bucket"
+if ! aws cloudformation describe-stacks --stack-name "$BOOTSTRAP_STACK" >/dev/null 2>&1; then
+  .venv/Scripts/cfn-lint infra/deploy-bucket.yaml
+  aws cloudformation deploy --stack-name "$BOOTSTRAP_STACK" --template-file infra/deploy-bucket.yaml \
+    --tags project=containerized-microservices --no-fail-on-empty-changeset
+fi
+TEMPLATE_BUCKET=$(aws cloudformation describe-stacks --stack-name "$BOOTSTRAP_STACK" \
+  --query "Stacks[0].Outputs[?OutputKey=='TemplateBucketName'].OutputValue" --output text | tr -d '\r')
+
 args=(--stack-name "$STACK_NAME" --template-file template.yaml
+      --s3-bucket "$TEMPLATE_BUCKET" --s3-prefix templates
       --capabilities CAPABILITY_NAMED_IAM
       --tags project=containerized-microservices
       --no-fail-on-empty-changeset)

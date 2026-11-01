@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build: dependencies are installed into a virtualenv in the builder stage; the
 # runtime stage copies only that venv and the application code (no pip cache, no build files).
-ARG PYTHON_IMAGE=python:3.12.16-slim-trixie
+# Docker Official Image via its ECR Public mirror (same digest as docker.io/library/python):
+# CodeBuild's shared IPs hit Docker Hub's anonymous pull rate limit.
+ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12.16-slim-trixie
 
 # ---------- builder ----------
 FROM ${PYTHON_IMAGE} AS builder
