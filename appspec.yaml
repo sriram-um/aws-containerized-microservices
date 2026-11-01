@@ -1,6 +1,9 @@
 # Exercise 6: CodeDeploy ECS blue/green. The CodeDeployToECS action replaces <TASK_DEFINITION>
-# with the revision it registers from taskdef.json. No capacity provider strategy here: the
-# replacement task set uses the cluster's default strategy (the EC2 capacity provider).
+# with the revision it registers from taskdef.json.
+# Exercise 8: capacity provider strategy per deployment. With the CODE_DEPLOY controller the
+# service's own strategy can't be updated, but every replacement task set takes this one:
+# 1 task always on regular Fargate (base), the rest split 1:3 between FARGATE and FARGATE_SPOT.
+#   2 tasks -> 1 FARGATE + 1 FARGATE_SPOT;  6 tasks -> 2 FARGATE + 4 FARGATE_SPOT
 version: 0.0
 Resources:
   - TargetService:
@@ -10,3 +13,10 @@ Resources:
         LoadBalancerInfo:
           ContainerName: product-service
           ContainerPort: 3000
+        CapacityProviderStrategy:
+          - CapacityProvider: FARGATE
+            Base: 1
+            Weight: 1
+          - CapacityProvider: FARGATE_SPOT
+            Base: 0
+            Weight: 3

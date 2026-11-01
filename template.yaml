@@ -754,6 +754,51 @@ Resources:
         ScaleInCooldown: 120
 
   # ---------------------------------------------------------------------------
+  # Exercise 8: Fargate Spot. The strategy (FARGATE base 1 + FARGATE_SPOT weight 3) lives in
+  # appspec.yaml: the CODE_DEPLOY service can't change its own strategy, but each deployment's
+  # task set takes the one from the AppSpec. Here: make Spot interruptions visible.
+  # ---------------------------------------------------------------------------
+  SpotInterruptionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      # EventBridge -> CloudWatch Logs targets must be named /aws/events/... (Project 4 lesson)
+      LogGroupName: !Sub /aws/events/${AWS::StackName}/spot-interruptions
+      RetentionInDays: 14
+
+  SpotInterruptionLogGroupPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-spot-events-to-logs'
+      # Allows EventBridge to write to this log group only (the console adds this silently; CFN doesn't)
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": ["events.amazonaws.com", "delivery.logs.amazonaws.com"]},
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": "${SpotInterruptionLogGroup.Arn}"
+          }]
+        }
+
+  SpotInterruptionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-spot-interruptions'
+      Description: Fargate Spot interruptions of tasks in this cluster (2-minute warning) to CloudWatch Logs
+      EventPattern:
+        source: [aws.ecs]
+        detail-type: [ECS Task State Change]
+        detail:
+          clusterArn: [!GetAtt Cluster.Arn]
+          stopCode: [SpotInterruption]
+      Targets:
+        - Id: spot-interruptions-log
+          Arn: !GetAtt SpotInterruptionLogGroup.Arn
+
+  # ---------------------------------------------------------------------------
   # Exercise 6: CI/CD - CodePipeline (GitHub) -> CodeBuild -> CodeDeploy ECS blue/green
   # ---------------------------------------------------------------------------
   # Blue/green needs a second target group and a test listener. CodeDeploy swaps the listeners'
