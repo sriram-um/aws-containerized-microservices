@@ -1,0 +1,6 @@
+# Only requirements.txt and product_service/ are needed in the build context
+*
+!requirements.txt
+!product_service/
+**/__pycache__
+**/*.pyc

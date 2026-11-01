@@ -20,8 +20,8 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 | # | Exercise | Services | Status |
 |---|---|---|---|
 | 0 | Project setup | git, Python venv, cfn-lint | ✅ Done |
-| 1 | Build container | Docker | ⏳ Next |
-| 2 | Push image to registry | Amazon ECR | ⬜ |
+| 1 | Build container | Docker | ✅ Done |
+| 2 | Push image to registry | Amazon ECR | ⏳ Next |
 | 3 | Deploy container as a task | Amazon ECS (EC2), VPC, RDS | ⬜ |
 | 4 | Scale with an ECS Service | ECS Service, ALB, Auto Scaling | ⬜ |
 | 5 | Monitoring | CloudWatch, Container Insights, X-Ray | ⬜ |
@@ -46,7 +46,10 @@ The project uses the same working agreement as the other portfolio projects:
 3. **Cost toggles.** Hourly-billed resources sit behind template parameters (`EnableCompute`,
    `EnableDatabase`). They are switched on for a demo and off again with explicit
    `--parameter-overrides`.
-4. **Document as we go.** Every phase adds a [build log](#build-log) entry with the commands that
+4. **One deploy identity.** Every resource is deployed by account `977534234172`, IAM user
+   `arn:aws:iam::977534234172:user/sriram` (AWS profile `default`). Scripts abort if
+   `aws sts get-caller-identity` returns any other identity.
+5. **Document as we go.** Every phase adds a [build log](#build-log) entry with the commands that
    were run, what was observed (real numbers), and any errors with their root cause and fix.
 
 ### Up-front decisions
@@ -109,10 +112,118 @@ py -3.12 -m venv .venv
 
 Files added: `.gitignore` (venv, caches, `*.env`), `.gitattributes` (`* text=auto eol=lf`, because
 the code is checked out on Windows but built on Linux in CodeBuild), `pytest.ini`
-(`testpaths = services`, so pytest never collects the live-AWS scripts in `scripts/`).
+(test paths limited to the service test folders, so pytest never collects the live-AWS scripts in
+`scripts/`).
 
 **Observations:** Docker Desktop has to be started by hand before any container work.
 
+### Phase 1 — Build the container (Docker) (2026-11-01)
+
+**What was built**
+
+| File | Purpose |
+|---|---|
+| [`product_service/main.py`](services/product-service/product_service/main.py) | FastAPI app: `GET /products`, `GET /health`. Connection pool opened at startup without waiting for the DB |
+| [`product_service/repository.py`](services/product-service/product_service/repository.py) | SQL for the `products` table; `NUMERIC` → JSON number |
+| [`product_service/config.py`](services/product-service/product_service/config.py) | Settings from env vars `DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD/DB_SSLMODE/APP_VERSION` |
+| [`product_service/seed.py`](services/product-service/product_service/seed.py) | Creates the table and 5 sample products; idempotent (`ON CONFLICT (sku) DO NOTHING`) |
+| [`Dockerfile`](services/product-service/Dockerfile) | Multi-stage, pinned base `python:3.12.16-slim-trixie`, non-root user, port 3000, `HEALTHCHECK` |
+| [`.dockerignore`](services/product-service/.dockerignore) | Allow-list: only `requirements.txt` and `product_service/` go into the build context |
+| [`tests/test_main.py`](services/product-service/tests/test_main.py) | 7 unit tests; the repository is replaced through FastAPI dependency overrides |
+| [`docker-compose.yml`](docker-compose.yml) | Local Postgres 16 → seed job → service, ordered by health/completion conditions |
+
+**API**
+
+| Request | Response |
+|---|---|
+| `GET /products` | `200 {"products": [{"id", "sku", "name", "description", "price", "stock"}], "count": n}` |
+| `GET /products`, database unreachable | `503 {"message": "Database unavailable"}` (after at most 5 s pool wait) |
+| `GET /health` | `200 {"status": "ok", "app_version": "…"}`; never touches the DB, so a DB outage doesn't make ECS/ALB kill healthy tasks |
+
+**Dockerfile design**
+
+- **Builder stage** creates `/opt/venv` and installs only `requirements.txt` (no test tools). It
+  then uninstalls the venv's own `pip`, which saves ~13 MB.
+- **Runtime stage** starts again from the slim base and copies just the venv and the code. There
+  are no compilers, no pip cache and no build files. `psycopg[binary]` ships its own libpq, so no
+  `apt-get` is needed.
+- Runs as non-root user `app` (uid 10001). `PYTHONDONTWRITEBYTECODE`/`PYTHONUNBUFFERED` are set, so
+  logs reach `docker logs`/CloudWatch immediately.
+- Exec-form `CMD`, so uvicorn is PID 1 and gets ECS's `SIGTERM`. `--proxy-headers` makes it trust
+  the ALB's `X-Forwarded-*` headers.
+- `HEALTHCHECK` uses Python's `urllib`, because the slim image has no curl. ECS ignores Dockerfile
+  health checks, so the task definition will declare the same check in Phase 3.
+
+**Commands run**
+
+```bash
+.venv/Scripts/python -m pip install -r services/product-service/requirements-dev.txt
+.venv/Scripts/python -m pytest -q                          # 7 passed
+docker build -t product-service:local services/product-service
+docker compose up --build -d
+curl localhost:3000/products
+docker compose run --rm seed                               # second run: still 5 products
+docker compose stop db; curl localhost:3000/products       # 503; /health still 200
+docker compose start db; curl localhost:3000/products      # 200 again, no restart needed
+docker compose stop product-service                        # graceful SIGTERM shutdown
+docker buildx build --platform linux/arm64 -t product-service:arm64 --load services/product-service
+docker compose down -v
+```
+
+**Measured**
+
+| What | Result |
+|---|---|
+| Unit tests | 7 passed in 1.4 s |
+| Image size (compressed, `docker image inspect`) | base 43 MB → **multi-stage 54 MB** (+11 MB). A naive single-stage build with dev deps and pip cache: 76 MB (+33 MB) |
+| venv size (uncompressed) | 53 MB → 40 MB after removing pip |
+| Build time, amd64 native | 38 s (cold) |
+| Build time, **arm64 under QEMU emulation** | **290 s** (7.6× slower) |
+| arm64 image | 56.7 MB, `aarch64`, psycopg `binary` implementation loads |
+| `GET /products` warm latency, local (20 calls) | min 6.7 ms, p50 8.7 ms, max 100 ms (first call) |
+| Compose start → container `healthy` | ~8 s |
+| DB stopped → `GET /products` | `503` in 8 ms (refused connection fails fast); recovers by itself when the DB is back |
+| `docker compose stop` (SIGTERM) | 1.9 s, exit code 0 (`Shutting down` → `Finished server process`) |
+
+**Issues hit and fixes**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `StarletteDeprecationWarning: Using httpx with starlette.testclient is deprecated` | Starlette 1.x moved its TestClient to `httpx2` | Dev dependency `httpx2==2.16.0` instead of `httpx` |
+| `cat: 'C:/Program Files/Git/etc/os-release'` from `docker run … cat /etc/os-release` | Git Bash rewrote the container path | `MSYS_NO_PATHCONV=1 docker run …` |
+| Docker Desktop sizes look wrong (`docker images`: base 384 MB, our image 248 MB) | With the containerd image store, `docker images` shows a different measure than `docker image inspect` | Compare with `docker image inspect --format '{{.Size}}'` (compressed); ECR's `imageSizeInBytes` will confirm in Phase 2 |
+| Size-comparison build failed at `pip install -r requirements-dev.txt` | The allow-list `.dockerignore` excludes everything except the runtime files (working as intended) | Built the comparison image from a temp copy outside the repo |
+
+## Repository layout
+
+```
+docker-compose.yml               local Postgres + seed + service
+pytest.ini
+services/product-service/
+  product_service/               FastAPI app (main, repository, config, seed)
+  tests/                         unit tests
+  Dockerfile  .dockerignore  requirements.txt  requirements-dev.txt
+```
+
+## Getting started (local)
+
+```bash
+py -3.12 -m venv .venv
+.venv/Scripts/python -m pip install -r services/product-service/requirements-dev.txt
+.venv/Scripts/python -m pytest -q
+
+docker compose up --build -d         # Postgres → seed → product-service on :3000
+curl http://localhost:3000/products
+docker compose down -v
+```
+
 ## Observations and lessons learned
 
-Filled in phase by phase with measured numbers and the errors hit along the way.
+- **Multi-stage pays off even on a slim base:** the app adds 11 MB instead of 33 MB. Most of the
+  saving comes from not shipping pip, its cache and the test tools.
+- **Don't build arm64 images on an x86 laptop routinely:** QEMU emulation made the build 7.6×
+  slower (290 s vs 38 s). CodeBuild will use a native ARM build host (Phase 6).
+- **Health check ≠ readiness of dependencies:** `/health` deliberately ignores the database. When
+  the DB went down, the container stayed `healthy` and served fast `503`s, then recovered on its
+  own when the DB came back. A DB-dependent health check would have restarted every task during a
+  DB outage.

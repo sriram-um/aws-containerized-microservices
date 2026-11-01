@@ -1,0 +1,39 @@
+# Local development: PostgreSQL + seed job + Product Service.
+#   docker compose up --build -d
+#   curl http://localhost:3000/products
+# The database password is a local-only value; in AWS it comes from the task definition
+# (exercise 3) and later from Secrets Manager (exercise 9).
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: products
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${LOCAL_DB_PASSWORD:-localdev}
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d products"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  seed:
+    build: ./services/product-service
+    image: product-service:local
+    command: ["python", "-m", "product_service.seed"]
+    environment: &db-env
+      DB_HOST: db
+      DB_NAME: products
+      DB_USER: postgres
+      DB_PASSWORD: ${LOCAL_DB_PASSWORD:-localdev}
+    depends_on:
+      db: { condition: service_healthy }
+
+  product-service:
+    image: product-service:local
+    environment:
+      <<: *db-env
+      APP_VERSION: local
+    ports: ["3000:3000"]
+    depends_on:
+      seed: { condition: service_completed_successfully }
