@@ -1,6 +1,8 @@
 # Exercise 6: CodeBuild - test, build and push the Product Service image, then produce the
 # CodeDeployToECS inputs (imageDetail.json, taskdef.json, appspec.yaml).
 # REPOSITORY_URI and TASK_DEFINITION_ARN come from the CodeBuild project (template.yaml).
+# The pipeline starts on pushes to main that touch services/product-service/**, buildspec.yml,
+# appspec.yaml or scripts/render_taskdef.py (CodePipeline V2 trigger with file-path filter).
 version: 0.2
 
 env:
