@@ -47,6 +47,7 @@ def main(minutes=30, images=False, subdir=""):
     if (arn := session.client("sts").get_caller_identity()["Arn"]) != EXPECTED_ARN:
         sys.exit(f"wrong AWS identity {arn}")
     cw = session.client("cloudwatch")
+    regional = {}  # widgets can read other Regions (replication lag is published in us-west-2)
     body = json.loads(cw.get_dashboard(DashboardName=f"{STACK}-dashboard")["DashboardBody"])
     end = datetime.now(timezone.utc)
     start = end - timedelta(minutes=minutes)
@@ -60,7 +61,8 @@ def main(minutes=30, images=False, subdir=""):
             namespace, metric, *dims = parts
             stat = opts.get("stat", props.get("stat", "Sum"))
             stat = "Sum" if stat.startswith("p") else stat  # just checking presence of data
-            resp = cw.get_metric_statistics(
+            rcw = regional.setdefault(props.get("region", "us-east-1"), session.client("cloudwatch", region_name=props.get("region", "us-east-1")))
+            resp = rcw.get_metric_statistics(
                 Namespace=namespace, MetricName=metric, StartTime=start, EndTime=end,
                 Period=minutes * 60, Statistics=[stat],
                 Dimensions=[{"Name": dims[i], "Value": dims[i + 1]} for i in range(0, len(dims), 2)])
@@ -72,7 +74,10 @@ def main(minutes=30, images=False, subdir=""):
             out = IMAGES / subdir
             out.mkdir(parents=True, exist_ok=True)
             widget_def = {**props, "start": f"-PT{minutes}M", "width": 600, "height": 300}
-            png = cw.get_metric_widget_image(MetricWidget=json.dumps(widget_def))["MetricWidgetImage"]
+            # render in the widget's own Region (a us-east-1 client draws a cross-Region widget empty)
+            region = props.get("region", "us-east-1")
+            rcw = regional.setdefault(region, session.client("cloudwatch", region_name=region))
+            png = rcw.get_metric_widget_image(MetricWidget=json.dumps(widget_def))["MetricWidgetImage"]
             name = re.sub(r"[^a-z0-9]+", "-", props["title"].lower()).strip("-")[:60]
             (out / f"dashboard-{name}.png").write_bytes(png)
     print(f"\n{empty} metric(s) without data in the last {minutes} min")

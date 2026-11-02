@@ -330,31 +330,63 @@ Resources:
       DBSubnetGroupDescription: Database subnets for the Product Service
       SubnetIds: [!Ref DatabaseSubnetA, !Ref DatabaseSubnetB]
 
-  Database:
-    Type: AWS::RDS::DBInstance
+  # Exercises 3-9: RDS for PostgreSQL db.t4g.micro instance `Database` - replaced by the Aurora
+  # Global Database below in exercise 10 (removed after the app moved to Aurora).
+
+  # ---------------------------------------------------------------------------
+  # Exercise 10: Amazon Aurora PostgreSQL Global Database (primary in us-east-1)
+  # The secondary cluster (us-west-2) is a separate stack: infra/aurora-secondary.yaml.
+  # Serverless v2 0.5-2 ACU per Region (demo sizing; AWS recommends >= 8 ACU on the primary of a
+  # busy global database). Burstable db.t* classes aren't supported for global databases.
+  # ---------------------------------------------------------------------------
+  GlobalDatabase:
+    Type: AWS::RDS::GlobalCluster
     Condition: DatabaseEnabled
-    # Demo data only (re-created by the seed task) - no final snapshot
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      DBInstanceIdentifier: !Sub '${AWS::StackName}-products'
-      Engine: postgres
+      GlobalClusterIdentifier: !Sub '${AWS::StackName}-global'
+      Engine: aurora-postgresql
       EngineVersion: '16.15'
-      DBInstanceClass: db.t4g.micro
-      AllocatedStorage: '20'
-      StorageType: gp3
       StorageEncrypted: true
-      MultiAZ: false
-      PubliclyAccessible: false
-      DBName: products
+      DeletionProtection: false
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Condition: DatabaseEnabled
+    DeletionPolicy: Delete       # demo data, re-created by the seed task
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBClusterIdentifier: !Sub '${AWS::StackName}-aurora-use1'
+      GlobalClusterIdentifier: !Ref GlobalDatabase
+      Engine: aurora-postgresql
+      EngineVersion: '16.15'
+      DatabaseName: products
       MasterUsername: productadmin
-      # Exercise 9: resolved by CloudFormation from the secret at deploy time; never in the template
       MasterUserPassword: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}'
       DBSubnetGroupName: !Ref DatabaseSubnetGroup
-      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]
+      VpcSecurityGroupIds: [!Ref DatabaseSecurityGroup]
+      StorageEncrypted: true      # AWS-managed key aws/rds
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 2
       BackupRetentionPeriod: 1
       DeletionProtection: false
-      AutoMinorVersionUpgrade: true
+      Tags:
+        - Key: project
+          Value: containerized-microservices
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: DatabaseEnabled
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-aurora-use1-1'
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
       Tags:
         - Key: project
           Value: containerized-microservices
@@ -488,8 +520,11 @@ Resources:
             - ContainerPort: 3000
               Protocol: tcp
           Environment:
+            # Exercise 10: the app only reads, so it uses the Aurora cluster's READER endpoint. It works
+            # whether this cluster is the global primary or (after a switchover) a secondary; writes
+            # (seed) use the writer endpoint (scripts/run_task.sh).
             - Name: DB_HOST
-              Value: !If [DatabaseEnabled, !GetAtt Database.Endpoint.Address, 'database-disabled']
+              Value: !If [DatabaseEnabled, !GetAtt AuroraCluster.ReadEndpoint.Address, 'database-disabled']
             - { Name: DB_PORT, Value: '5432' }
             - { Name: DB_NAME, Value: products }
             - { Name: DB_SSLMODE, Value: require }
@@ -1309,15 +1344,23 @@ Resources:
                   [".", "UnHealthyHostCount", ".", "${TargetGroup1}", ".", ".", {"label": "Unhealthy - target group 1"}],
                   [".", ".", ".", "${TargetGroup2}", ".", ".", {"label": "Unhealthy - target group 2"}]
                 ]}},
-              {"type": "metric", "x": 0, "y": 12, "width": 12, "height": 6, "properties": {
-                "title": "RDS PostgreSQL - CPU (%) and connections", "region": "${AWS::Region}",
+              {"type": "metric", "x": 0, "y": 12, "width": 8, "height": 6, "properties": {
+                "title": "Aurora primary (us-east-1) - capacity (ACU) and connections", "region": "${AWS::Region}",
                 "view": "timeSeries", "stat": "Average", "period": 60, "yAxis": {"left": {"min": 0}, "right": {"min": 0}},
                 "metrics": [
-                  ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${AWS::StackName}-products", {"label": "CPUUtilization"}],
+                  ["AWS/RDS", "ServerlessDatabaseCapacity", "DBClusterIdentifier", "${AWS::StackName}-aurora-use1", {"label": "ServerlessDatabaseCapacity (ACU)"}],
                   [".", "DatabaseConnections", ".", ".", {"label": "DatabaseConnections", "yAxis": "right"}]
                 ]}},
-              {"type": "text", "x": 12, "y": 12, "width": 12, "height": 6, "properties": {
-                "markdown": "## Product Service (ECS on Fargate, service product-api)\n* **Deployments:** CodePipeline + CodeDeploy blue/green, canary 10 % / 5 min\n* **Traces:** X-Ray via the ADOT collector sidecar, sampling ${TraceSampleRatio}. This account uses CloudWatch Transaction Search: spans are in the log group `aws/spans`.\n* **Logs:** `/ecs/${AWS::StackName}/product-service`\n* **Scaling:** CPU target 60 %, 2-6 Fargate tasks (0.25 vCPU / 0.5 GB, ARM64)\n* **RDS widget** is empty while `EnableDatabase=false`."
+              {"type": "metric", "x": 8, "y": 12, "width": 8, "height": 6, "properties": {
+                "title": "Aurora Global Database - replication lag to us-west-2 (ms)", "region": "us-west-2",
+                "view": "timeSeries", "period": 60, "yAxis": {"left": {"min": 0}},
+                "metrics": [
+                  ["AWS/RDS", "AuroraGlobalDBReplicationLag", "DBClusterIdentifier", "${AWS::StackName}-aurora-usw2", "SourceRegion", "${AWS::Region}", {"stat": "Average", "label": "ReplicationLag avg"}],
+                  ["...", {"stat": "Maximum", "label": "ReplicationLag max"}],
+                  [".", "AuroraGlobalDBRPOLag", ".", ".", ".", ".", {"stat": "Maximum", "label": "RPOLag max"}]
+                ]}},
+              {"type": "text", "x": 16, "y": 12, "width": 8, "height": 6, "properties": {
+                "markdown": "## Product Service (ECS on Fargate, service product-api)\n* **Deployments:** CodePipeline + CodeDeploy blue/green, canary 10 % / 5 min\n* **Traces:** X-Ray via the ADOT collector sidecar, sampling ${TraceSampleRatio}. This account uses CloudWatch Transaction Search: spans are in the log group `aws/spans`.\n* **Logs:** `/ecs/${AWS::StackName}/product-service`\n* **Scaling:** CPU target 60 %, 2-6 Fargate tasks (0.25 vCPU / 0.5 GB, ARM64)\n* **Database:** Aurora PostgreSQL Global Database (us-east-1 primary, us-west-2 secondary); app reads via the reader endpoint. Aurora widgets are empty while `EnableDatabase=false`."
               }}
             ]
           }
@@ -1346,9 +1389,18 @@ Outputs:
     Value: !Ref ProductServiceTaskDefinition
   LogGroupName:
     Value: !Ref ProductServiceLogGroup
-  DatabaseEndpoint:
+  GlobalClusterIdentifier:
     Condition: DatabaseEnabled
-    Value: !GetAtt Database.Endpoint.Address
+    Value: !Ref GlobalDatabase
+  AuroraClusterIdentifier:
+    Condition: DatabaseEnabled
+    Value: !Ref AuroraCluster
+  AuroraWriterEndpoint:
+    Condition: DatabaseEnabled
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+  AuroraReaderEndpoint:
+    Condition: DatabaseEnabled
+    Value: !GetAtt AuroraCluster.ReadEndpoint.Address
   ProductsUrl:
     Condition: ComputeEnabled
     Value: !Sub 'http://${LoadBalancer.DNSName}/products'

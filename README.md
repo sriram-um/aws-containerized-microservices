@@ -29,8 +29,8 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 | 7 | Replace EC2 with Fargate | AWS Fargate | ✅ Done |
 | 8 | Spot capacity | Fargate Spot capacity providers | ✅ Done |
 | 9 | Database credentials | AWS Secrets Manager | ✅ Done |
-| 10 | Disaster recovery | Aurora Global Database | ⏳ Next |
-| 11 | Cost estimate | AWS Pricing Calculator | ⬜ |
+| 10 | Disaster recovery | Aurora Global Database | ✅ Done |
+| 11 | Cost estimate | AWS Pricing Calculator | ⏳ Next |
 | 12 | Real-world project | Orders service (Project 3) on ECS | ⬜ |
 | 13 | Close-out | Well-Architected review, teardown/rebuild | ⬜ |
 
@@ -944,12 +944,115 @@ found 1-14.
 **Costs added:** secret $0.40/month (+ $0.05 per 10 000 API calls; one call per task start),
 `secretsmanager` endpoint 2 AZs × $0.01 = **$0.02/h**. Running total ≈ **$0.17/h**.
 
+### Phase 10 — Disaster recovery with an Aurora PostgreSQL Global Database (2026-11-01)
+
+**Decisions (agreed up front):** Aurora PostgreSQL **16.15**, **Serverless v2 0.5-2 ACU** in each
+Region (≈ $0.12/h idle for both), and **database-only DR**: the app keeps running in us-east-1
+only. A global database needs memory-optimized classes (`db.r5`+) or Serverless v2; burstable
+`db.t4g` isn't allowed. AWS recommends ≥ 8 ACU on the primary of a busy global database; this
+demo stays at 0.5-2 ACU.
+
+**Architecture after this phase**
+
+```
+ us-east-1 (stack containerized-microservices)                us-west-2 (stack containerized-microservices-dr)
+ ┌──────────────────────────────────────────────┐             ┌──────────────────────────────────────────┐
+ │ Fargate tasks ──read──► reader endpoint      │             │ VPC 10.60.0.0/16, 2 DB subnets, SG with  │
+ │ seed / write-load ──► writer endpoint        │  storage-   │ no ingress (nothing connects here)       │
+ │ Aurora cluster ...-aurora-use1 (primary)     │  level      │ Aurora cluster ...-aurora-usw2 (secondary│
+ │   db.serverless 0.5-2 ACU, aws/rds key       │ ──────────► │   read-only), db.serverless 0.5-2 ACU,   │
+ │ secret containerized-microservices/database  │ replication │   KmsKeyId alias/aws/rds (us-west-2)     │
+ └──────────────────────────────────────────────┘             └──────────────────────────────────────────┘
+                     AWS::RDS::GlobalCluster containerized-microservices-global
+```
+
+**What was built**
+
+| Where | Resources | Notes |
+|---|---|---|
+| [`template.yaml`](template.yaml) | `GlobalDatabase` (`AWS::RDS::GlobalCluster`, engine + version, encrypted), `AuroraCluster` (joins the global cluster; password via `{{resolve:secretsmanager}}` from Phase 9), `AuroraInstance` (`db.serverless`) | Reuses the database subnets and the `database` security group (5432 from the app SG only) |
+| [`infra/aurora-secondary.yaml`](infra/aurora-secondary.yaml) (us-west-2) | VPC, 2 DB subnets, subnet group, security group without ingress, secondary cluster (no master credentials: inherited), `db.serverless` instance | Its own small stack rather than a Region condition in the 60 KB main template. One instance, because a headless secondary can't take over in a switchover. `KmsKeyId: alias/aws/rds`: an encrypted secondary needs a key in its own Region |
+| App | `DB_HOST` = the us-east-1 cluster's **reader endpoint** | The app only reads; the reader endpoint answers whether the cluster is primary or secondary |
+| Scripts | [`scripts/deploy_secondary.sh`](scripts/deploy_secondary.sh); [`scripts/run_task.sh`](scripts/run_task.sh) `seed`/`write-load` use the **writer** endpoint (`write-load` = 20 inserts/s into `replication_probe`); `stop` now only stops tasks started with `api` (the service shares the task family); [`scripts/dr_drill.py`](scripts/dr_drill.py) | |
+| Dashboard | RDS widget → "Aurora primary - capacity (ACU) and connections" + "replication lag to us-west-2" (a **us-west-2** widget on the us-east-1 dashboard) | `check_dashboard.py` queries and renders each widget in its own Region |
+| Removed | The RDS `db.t4g.micro` instance `Database` and its output | After the app moved to Aurora |
+
+**Migration without downtime (5 deploys)**
+
+| Step | What | Duration | Probe |
+|---|---|---|---|
+| D1 | Global cluster + Aurora primary next to RDS | 429 s | — |
+| seed | `run_task.sh seed` via the writer endpoint (Fargate task) | 71 s | — |
+| D2 | Secondary stack in us-west-2 | 633 s | — |
+| D3 | `DB_HOST` → Aurora reader endpoint, pipeline run (revision 19) | 69 s + pipeline | **778/778 `200`** |
+| D4 | RDS instance removed, dashboard updated | 155 s | **131/131 `200`** |
+
+**Measured: replication lag** (`AuroraGlobalDBReplicationLag`, `AuroraGlobalDBRPOLag`, us-west-2)
+
+| Period | Lag avg | Lag max | RPO lag max | Primary capacity |
+|---|---|---|---|---|
+| Idle | 35-96 ms | up to ~1 000 ms | 0 ms | 0.5 ACU |
+| `write-load` 240 s, 4 465 inserts (~18.6/s) | **30-60 ms** | 110-600 ms | **227-801 ms** | **2 ACU** (the configured maximum) |
+
+![Aurora Global Database replication lag and RPO lag to us-west-2](docs/images/phase10/dashboard-aurora-global-database-replication-lag-to-us-west-2-ms.png)
+
+![Aurora primary Serverless v2 capacity (ACU) and database connections](docs/images/phase10/dashboard-aurora-primary-us-east-1-capacity-acu-and-connections.png)
+
+The ~1 s *maximum* while idle and the lower average under load suggest that, without writes,
+progress is only reported periodically. The figure that matters for DR is the **RPO lag**: the
+data that an unplanned failover could lose was **under 1 s** at this write rate.
+
+**Measured: DR drill** ([`scripts/dr_drill.py`](scripts/dr_drill.py), managed switchover = planned, RPO 0)
+
+| | us-east-1 → us-west-2 | us-west-2 → us-east-1 |
+|---|---|---|
+| `switchover-global-cluster` → status `available` with the new writer | **47 s** | **44 s** |
+| Writer changed after | 31 s | 33 s |
+| RDS events (way back) | started 01:05:43 → old primary shut down 01:06:04 → new primary promoted 01:06:15 → completed 01:06:17 UTC | |
+| Probe `GET /products` (app → us-east-1 reader endpoint) | 102 requests, **5 failed** over ~11 s | 70 requests, **7 failed** over ~29 s |
+| Failure types | `503` (the app's own "Database unavailable" from Phase 1) and probe timeouts (the pool waits up to 5 s) | same |
+| ECS tasks | **not replaced** (`/health` doesn't touch the DB), recovered on their own | |
+
+Whole drill: **17 of 244 requests (7 %) failed**, all within the two switchover windows. Data loss:
+none (managed switchover waits for the secondary to be fully synchronized). An *unplanned*
+regional failover would be `aws rds failover-global-cluster --allow-data-loss`, losing at most the
+RPO lag (< 1 s measured).
+
+**What "database-only DR" means here:** after a real us-east-1 outage the data would be safe in
+us-west-2 and writable within about a minute. But the app would still have to be started there
+(VPC endpoints, ALB, ECS service, DNS); none of that was built (agreed scope). That is the main
+gap between this setup's database RTO (~1 min) and a full-application RTO.
+
+**Issues hit and fixes**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `boto3` check said `switchover_global_cluster` doesn't exist | `operation_names` are PascalCase (`SwitchoverGlobalCluster`) | Compare with the right form (playbook: check the SDK model before believing a "doesn't exist") |
+| Replication-lag widget image empty with warning icons, although the metric has data | `GetMetricWidgetImage` called in us-east-1 for a widget whose `region` is us-west-2 | Render each widget with a client in its own Region |
+| `run_task.sh stop` would have stopped the service's tasks | It filtered by task family, which the service shares since Phase 6 | Filter by `--started-by api` |
+| `printf: 1003.0: invalid number` in a metrics loop | `\r` from the Windows AWS CLI output | Cosmetic; values printed anyway (strip `\r`) |
+
+**Running cost now** (us-east-1 + us-west-2, list prices)
+
+| Item | $/hour |
+|---|---|
+| Aurora Serverless v2: 0.5 ACU × 2 Regions × $0.12 (idle; up to 4 ACU = $0.48 under load) | 0.12 |
+| Aurora storage ($0.10/GB-month), I/O ($0.20/M), replicated writes | cents |
+| Fargate (1 on-demand + 1 Spot) | ≈ 0.013 |
+| 5 interface endpoints (ecr.api, ecr.dkr, logs, xray, secretsmanager) × 2 AZ | 0.10 |
+| ALB + Container Insights | ≈ 0.03 |
+| **Total** | **≈ $0.27/h** (RDS -$0.016, Aurora global +$0.12) |
+
+**Teardown order matters:** the us-west-2 stack (secondary) must be deleted **before** the primary
+stack, because a global cluster can't be deleted while it has members (Phase 13).
+
 ## Repository layout
 
 ```
 template.yaml                    CloudFormation: one stack, extended per exercise
 buildspec.yml  appspec.yaml       CodeBuild / CodeDeploy (exercise 6)
 infra/deploy-bucket.yaml         bootstrap: S3 bucket that stages template.yaml
+infra/aurora-secondary.yaml      us-west-2 stack: Aurora Global Database secondary (exercise 10)
 scripts/                         lib.sh (identity guard), deploy.sh, push_image.sh, run_task.sh, render_taskdef.py,
                                  load_test.py, check_dashboard.py
 docs/                            load-test CSVs, dashboard images, cost estimate (later)
@@ -1038,3 +1141,9 @@ scripts/push_image.sh      # build arm64 image, tag with the git SHA, push to EC
 - **A secret in an environment variable leaks into everything that copies the task definition:**
   14 immutable revisions and the pipeline artifacts still held the old value. Changing the
   password afterwards is what actually closed the gap, not only moving it to Secrets Manager.
+- **A global database makes the data regional-failure-proof, not the application:** switchover
+  took ~45 s with RPO 0, but with compute only in us-east-1 the app's own regional DR would still
+  need a second deployment.
+- **Design for the switchover blip:** the app returned fast `503`s and recovered by itself because
+  `/health` ignores the database (Phase 1). With a DB-dependent health check, ECS would have killed
+  and replaced every task during the 45-second role change.

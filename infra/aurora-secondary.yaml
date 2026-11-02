@@ -1,0 +1,108 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Exercise 10: secondary Region (us-west-2) of the containerized-microservices Aurora PostgreSQL
+  Global Database. Database only: a small VPC with two private DB subnets and a read-only
+  secondary cluster. No compute runs here (DR scope agreed for this project).
+  Deployed with scripts/deploy_secondary.sh after the primary stack created the global cluster.
+
+Parameters:
+  GlobalClusterIdentifier:
+    Type: String
+    Default: containerized-microservices-global
+
+Mappings:
+  Network:
+    Vpc: { Cidr: 10.60.0.0/16 }
+    DatabaseA: { Cidr: 10.60.20.0/24 }
+    DatabaseB: { Cidr: 10.60.21.0/24 }
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [Network, Vpc, Cidr]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-vpc' }
+        - { Key: project, Value: containerized-microservices }
+
+  DatabaseSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !FindInMap [Network, DatabaseA, Cidr]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-database-a' }
+
+  DatabaseSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !FindInMap [Network, DatabaseB, Cidr]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-database-b' }
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Aurora secondary cluster subnets
+      SubnetIds: [!Ref DatabaseSubnetA, !Ref DatabaseSubnetB]
+
+  # No ingress: nothing in this Region connects to the database (replication is AWS-internal).
+  # A standby app in this Region would get a rule like the primary's (5432 from its task SG).
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora secondary cluster - no inbound access
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-database' }
+
+  # Secondary cluster: no master credentials (inherited from the primary), read-only until a
+  # switchover/failover makes it the primary
+  SecondaryCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBClusterIdentifier: containerized-microservices-aurora-usw2
+      GlobalClusterIdentifier: !Ref GlobalClusterIdentifier
+      Engine: aurora-postgresql
+      EngineVersion: '16.15'
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VpcSecurityGroupIds: [!Ref DatabaseSecurityGroup]
+      StorageEncrypted: true
+      KmsKeyId: alias/aws/rds          # an encrypted secondary needs a key in its own Region
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 2
+      DeletionProtection: false
+      Tags:
+        - Key: project
+          Value: containerized-microservices
+
+  # One instance, so the secondary can take over in a switchover (a "headless" secondary can't)
+  SecondaryInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: containerized-microservices-aurora-usw2-1
+      DBClusterIdentifier: !Ref SecondaryCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      Tags:
+        - Key: project
+          Value: containerized-microservices
+
+Outputs:
+  SecondaryClusterIdentifier:
+    Value: !Ref SecondaryCluster
+  SecondaryClusterArn:
+    Value: !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${SecondaryCluster}
+  SecondaryReaderEndpoint:
+    Value: !GetAtt SecondaryCluster.ReadEndpoint.Address
