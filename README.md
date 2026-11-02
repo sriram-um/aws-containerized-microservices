@@ -30,8 +30,8 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 | 8 | Spot capacity | Fargate Spot capacity providers | ✅ Done |
 | 9 | Database credentials | AWS Secrets Manager | ✅ Done |
 | 10 | Disaster recovery | Aurora Global Database | ✅ Done |
-| 11 | Cost estimate | AWS Pricing Calculator | ⏳ Next |
-| 12 | Real-world project | Orders service (Project 3) on ECS | ⬜ |
+| 11 | Cost estimate | AWS Pricing Calculator | ✅ Done ([docs/cost-estimate.md](docs/cost-estimate.md)) |
+| 12 | Real-world project | Orders service (Project 3) on ECS | ⏳ Next |
 | 13 | Close-out | Well-Architected review, teardown/rebuild | ⬜ |
 
 ## Process
@@ -1045,6 +1045,35 @@ gap between this setup's database RTO (~1 min) and a full-application RTO.
 
 **Teardown order matters:** the us-west-2 stack (secondary) must be deleted **before** the primary
 stack, because a global cluster can't be deleted while it has members (Phase 13).
+
+### Phase 11 — Cost estimate (2026-11-01)
+
+Full estimate with every line item and the AWS Pricing Calculator entries:
+**[docs/cost-estimate.md](docs/cost-estimate.md)** (list prices from the AWS Price List API).
+
+| | Monthly (24×7) |
+|---|---|
+| Fixed, independent of traffic | **≈ $200** |
+| Scenario A: 10 M requests/month | **≈ $247** |
+| Scenario B: 100 M requests/month | **≈ $360** |
+| Everything switched off (`EnableCompute=false EnableDatabase=false`) | ≈ $1 |
+
+| Cost driver (scenario A) | Share |
+|---|---|
+| Aurora Global Database (2 Regions; $87.60 is just the 0.5-ACU floor in both) | 53 % |
+| 5 interface VPC endpoints × 2 AZs | 30 % |
+| ALB | 7 % |
+| Monitoring | 6 % |
+| **Fargate compute** | **4 %** |
+
+**Takeaways**
+- The containers are the cheapest part. The bill is driven by two requirements: cross-Region DR
+  for the database and no internet egress.
+- Biggest savings if those requirements are relaxed: headless secondary (−$43.80, longer RTO),
+  endpoints in one AZ (−$36.50, less resilient), Container Insights off (−$9.50).
+- The build day itself cost an estimated **$3-4**. Not yet verifiable per project: Cost Explorer
+  lags 24 h and the `project` cost-allocation tag is **inactive** in this account. The actual
+  Fargate Spot discount (assumed 70 %) is checked the same way.
 
 ## Repository layout
 
