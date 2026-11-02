@@ -16,6 +16,10 @@ Parameters:
     Default: 'false'
   # (Exercises 3-8 had a NoEcho DBPassword parameter here; exercise 9 replaced it with the
   # generated Secrets Manager secret DatabaseSecret.)
+  OrdersServiceImageTag:
+    Description: Initial image tag (git SHA) in the orders-service ECR repository; the orders pipeline deploys later images
+    Type: String
+    Default: 0ece94e
   ProductServiceImageTag:
     Description: Image tag (git SHA) in the product-service ECR repository
     Type: String
@@ -1474,7 +1478,471 @@ Resources:
       SubnetIds: [!Ref PrivateSubnetB]
       SecurityGroupIds: [!Ref EndpointSecurityGroup]
 
+  # Network: own security group (the orders tasks need neither Aurora nor the product port)
+  OrdersSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Orders Service tasks - 3000 from the ALB only
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-orders' }
+
+  OrdersFromAlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref OrdersSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: From the ALB (traffic + health checks)
+
+  AlbToOrdersEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      DestinationSecurityGroupId: !Ref OrdersSecurityGroup
+      Description: To Orders Service tasks
+
+  EndpointsFromOrdersIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref OrdersSecurityGroup
+      Description: Orders tasks (ECR, logs, X-Ray, Cognito)
+
+  OrdersTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: ComputeEnabled
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 3000
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+
+  # Path-based routing on the existing :80 listener. A separate rule resource, so the listener
+  # itself (whose default action CodeDeploy swaps for the product service) stays untouched.
+  OrdersListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: ComputeEnabled
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: [/orders, /orders/*]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref OrdersTargetGroup
+
+  OrdersLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /ecs/${AWS::StackName}/orders-service
+      RetentionInDays: 14
+
+  # Execution role (ECS agent): pull from orders-service + the collector cache, write its log group
+  OrdersExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: pull-image-and-write-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability]
+                Resource:
+                  - !GetAtt OrdersServiceRepository.Arn
+                  - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/ecr-public/aws-observability/*
+              - Effect: Allow
+                Action: [ecr:CreateRepository, ecr:BatchImportUpstreamImage]
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/ecr-public/aws-observability/*
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt OrdersLogGroup.Arn
+
+  # Task role (the app): this table only, and only the three operations it uses; plus X-Ray
+  OrdersTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: orders-table-and-xray
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:BatchWriteItem, dynamodb:PutItem, dynamodb:Query]
+                Resource: !GetAtt OrdersTable.Arn
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, xray:GetSamplingRules,
+                         xray:GetSamplingTargets, xray:GetSamplingStatisticSummaries]
+                Resource: '*'
+
+  OrdersTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: orders-service
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt OrdersExecutionRole.Arn
+      TaskRoleArn: !GetAtt OrdersTaskRole.Arn
+      ContainerDefinitions:
+        - Name: orders-service
+          Image: !Sub '${OrdersServiceRepository.RepositoryUri}:${OrdersServiceImageTag}'
+          Essential: true
+          ReadonlyRootFilesystem: true
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - { Name: TABLE_NAME, Value: !Ref OrdersTable }
+            - { Name: USER_POOL_ID, Value: !Ref UserPool }
+            - { Name: APP_CLIENT_ID, Value: !Ref UserPoolClient }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: APP_VERSION, Value: !Ref OrdersServiceImageTag }
+            - { Name: OTEL_EXPORTER_OTLP_ENDPOINT, Value: 'http://127.0.0.1:4318' }
+            - { Name: TRACE_SAMPLE_RATIO, Value: !Ref TraceSampleRatio }
+          DependsOn:
+            - ContainerName: aws-otel-collector
+              Condition: START
+          HealthCheck:
+            Command: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/health', timeout=2)"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 15
+          StopTimeout: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref OrdersLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: orders-service
+        - Name: aws-otel-collector
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/ecr-public/aws-observability/aws-otel-collector:${AdotCollectorVersion}'
+          Essential: false
+          Cpu: 64
+          Memory: 128
+          MemoryReservation: 64
+          Command: ['--config=env:AOT_CONFIG_CONTENT']
+          Environment:
+            - Name: AOT_CONFIG_CONTENT
+              Value: !Sub |
+                extensions:
+                  health_check:
+                    endpoint: 127.0.0.1:13133
+                receivers:
+                  otlp:
+                    protocols:
+                      http:
+                        endpoint: 127.0.0.1:4318
+                processors:
+                  batch/traces:
+                    timeout: 1s
+                    send_batch_size: 50
+                exporters:
+                  awsxray:
+                    region: ${AWS::Region}
+                service:
+                  extensions: [health_check]
+                  pipelines:
+                    traces:
+                      receivers: [otlp]
+                      processors: [batch/traces]
+                      exporters: [awsxray]
+          HealthCheck:
+            Command: [CMD, /healthcheck]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref OrdersLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: orders-service
+
+  # ECS deployment controller (rolling) on purpose, next to the product service's CodeDeploy
+  # blue/green: the circuit breaker rolls back failed deployments; the capacity provider strategy
+  # can live on the service itself here.
+  OrdersService:
+    Type: AWS::ECS::Service
+    Condition: ComputeEnabled
+    DependsOn: [OrdersListenerRule, ClusterCapacityProviders, EcrPublicPullThroughCache, XRayEndpoint,
+                CognitoIdpEndpoint, OrdersTaskDefinition]
+    Properties:
+      ServiceName: orders-api
+      Cluster: !Ref Cluster
+      # Family name: the orders pipeline registers new revisions (new image); CloudFormation must
+      # not reset the service to its own revision on every stack update (same idea as exercise 6)
+      TaskDefinition: orders-service
+      CapacityProviderStrategy:
+        - { CapacityProvider: FARGATE, Base: 1, Weight: 1 }
+        - { CapacityProvider: FARGATE_SPOT, Weight: 3 }
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref OrdersSecurityGroup]
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: orders-service
+          ContainerPort: 3000
+          TargetGroupArn: !Ref OrdersTargetGroup
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentController:
+        Type: ECS
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: project
+          Value: containerized-microservices
+
+  OrdersScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: ComputeEnabled
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub service/${Cluster}/${OrdersService.Name}
+      MinCapacity: 2
+      MaxCapacity: 4
+
+  OrdersCpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: ComputeEnabled
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-orders-cpu60'
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref OrdersScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 60
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 120
+
+  # Orders pipeline: GitHub -> Build (test, image) -> Deploy (register task definition, rolling update)
+  OrdersCodeBuildRole:
+    Type: AWS::IAM::Role
+    Condition: ComputeEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: build-and-deploy-orders-service
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${CodeBuildLogGroup.Arn}'
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:InitiateLayerUpload, ecr:UploadLayerPart,
+                         ecr:CompleteLayerUpload, ecr:PutImage, ecr:BatchGetImage,
+                         ecr:GetDownloadUrlForLayer, ecr:DescribeImages]
+                Resource: !GetAtt OrdersServiceRepository.Arn
+              - Effect: Allow
+                # Describe/Register have no resource-level scoping
+                Action: [ecs:DescribeTaskDefinition, ecs:RegisterTaskDefinition, ecs:TagResource]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecs:UpdateService, ecs:DescribeServices]
+                Resource: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${Cluster}/orders-api
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt OrdersExecutionRole.Arn, !GetAtt OrdersTaskRole.Arn]
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  OrdersBuild:
+    Type: AWS::CodeBuild::Project
+    Condition: ComputeEnabled
+    Properties:
+      Name: !Sub '${AWS::StackName}-orders-build'
+      ServiceRole: !GetAtt OrdersCodeBuildRole.Arn
+      Source: { Type: CODEPIPELINE, BuildSpec: services/orders-service/buildspec.yml }
+      Artifacts: { Type: CODEPIPELINE }
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: REPOSITORY_URI, Value: !GetAtt OrdersServiceRepository.RepositoryUri }
+      Cache: { Type: LOCAL, Modes: [LOCAL_DOCKER_LAYER_CACHE, LOCAL_SOURCE_CACHE] }
+      LogsConfig:
+        CloudWatchLogs: { Status: ENABLED, GroupName: !Ref CodeBuildLogGroup, StreamName: orders-build }
+      TimeoutInMinutes: 20
+
+  OrdersDeploy:
+    Type: AWS::CodeBuild::Project
+    Condition: ComputeEnabled
+    Properties:
+      Name: !Sub '${AWS::StackName}-orders-deploy'
+      ServiceRole: !GetAtt OrdersCodeBuildRole.Arn
+      Source: { Type: CODEPIPELINE, BuildSpec: services/orders-service/deployspec.yml }
+      Artifacts: { Type: CODEPIPELINE }
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        EnvironmentVariables:
+          - { Name: TASK_DEFINITION_ARN, Value: !Ref OrdersTaskDefinition }
+          - { Name: CLUSTER, Value: !Ref Cluster }
+          - { Name: SERVICE, Value: orders-api }
+      LogsConfig:
+        CloudWatchLogs: { Status: ENABLED, GroupName: !Ref CodeBuildLogGroup, StreamName: orders-deploy }
+      TimeoutInMinutes: 30
+
+  OrdersPipelineRole:
+    Type: AWS::IAM::Role
+    Condition: ComputeEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: orders-pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketVersioning]
+                Resource: [!GetAtt ArtifactBucket.Arn, !Sub '${ArtifactBucket.Arn}/*']
+              - Effect: Allow
+                Action: [codeconnections:UseConnection, codestar-connections:UseConnection]
+                Resource: !Ref GitHubConnection
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: [!GetAtt OrdersBuild.Arn, !GetAtt OrdersDeploy.Arn]
+
+  OrdersPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Condition: ComputeEnabled
+    Properties:
+      Name: !Sub '${AWS::StackName}-orders-service'
+      PipelineType: V2
+      ExecutionMode: QUEUED
+      RoleArn: !GetAtt OrdersPipelineRole.Arn
+      ArtifactStore: { Type: S3, Location: !Ref ArtifactBucket }
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: Source
+            Push:
+              - Branches: { Includes: [!Ref GitHubBranch] }
+                FilePaths: { Includes: [services/orders-service/**, scripts/render_taskdef.py] }
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: '1' }
+              Configuration:
+                ConnectionArn: !Ref GitHubConnection
+                FullRepositoryId: !Ref GitHubRepository
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts: [{ Name: SourceOutput }]
+        - Name: Build
+          Actions:
+            - Name: TestBuildPush
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: '1' }
+              Configuration: { ProjectName: !Ref OrdersBuild }
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: BuildOutput }]
+        - Name: Deploy
+          Actions:
+            - Name: EcsRolling
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: '1' }
+              Configuration: { ProjectName: !Ref OrdersDeploy }
+              InputArtifacts: [{ Name: BuildOutput }]
+      Tags:
+        - Key: project
+          Value: containerized-microservices
+
 Outputs:
+  OrdersUrl:
+    Condition: ComputeEnabled
+    Value: !Sub 'http://${LoadBalancer.DNSName}/orders'
+  OrdersServiceName:
+    Condition: ComputeEnabled
+    Value: !GetAtt OrdersService.Name
+  OrdersPipelineName:
+    Condition: ComputeEnabled
+    Value: !Ref OrdersPipeline
   OrdersServiceRepositoryUri:
     Value: !GetAtt OrdersServiceRepository.RepositoryUri
   OrdersTableName:
