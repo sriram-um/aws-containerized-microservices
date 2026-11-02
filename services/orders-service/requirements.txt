@@ -1,0 +1,10 @@
+fastapi==0.162.0
+uvicorn==0.54.0
+boto3==1.43.123
+pyjwt[crypto]==2.15.1
+opentelemetry-sdk==1.45.2
+opentelemetry-exporter-otlp-proto-http==1.45.2
+opentelemetry-instrumentation-fastapi==0.66b2
+opentelemetry-instrumentation-botocore==0.66b2
+opentelemetry-sdk-extension-aws==2.1.0
+opentelemetry-propagator-aws-xray==1.0.2

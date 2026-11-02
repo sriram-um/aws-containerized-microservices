@@ -42,3 +42,11 @@ def test_sets_image_placeholder_and_version_only_on_app_container():
 def test_missing_app_container_fails():
     with pytest.raises(ValueError):
         render({"containerDefinitions": [{"name": "other", "image": "x"}]}, "abc1234")
+
+
+def test_other_container_and_real_image():
+    described = {**DESCRIBED, "containerDefinitions": [
+        {"name": "orders-service", "image": "repo/orders-service:old", "environment": []}]}
+    td = render(described, "abc1234", "orders-service", "repo/orders-service:abc1234")
+    assert td["containerDefinitions"][0]["image"] == "repo/orders-service:abc1234"
+    assert {"name": "APP_VERSION", "value": "abc1234"} in td["containerDefinitions"][0]["environment"]

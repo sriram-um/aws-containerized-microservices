@@ -1,0 +1,27 @@
+# Exercise 12: orders pipeline, Deploy stage - ECS rolling deployment (no CodeDeploy).
+# Takes the task definition CloudFormation registered (TASK_DEFINITION_ARN: roles, sidecar, env),
+# swaps in the new image, registers it and updates the service. The ECS deployment circuit breaker
+# rolls back automatically if the new tasks don't become healthy.
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  build:
+    on-failure: ABORT
+    commands:
+      - source image.env
+      - aws ecs describe-task-definition --task-definition "$TASK_DEFINITION_ARN" --query taskDefinition > td.json
+      - python scripts/render_taskdef.py td.json "$TAG" orders-service "$IMAGE_URI" > taskdef.json
+      - NEW_TD=$(aws ecs register-task-definition --cli-input-json file://taskdef.json --query taskDefinition.taskDefinitionArn --output text)
+      - echo "registered $NEW_TD"
+      - aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$NEW_TD" --query 'service.deployments[0].id' --output text
+      # services-stable works for the ECS deployment controller (not for CODE_DEPLOY services)
+      - aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+      - |
+        STATE=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].deployments[?status==`PRIMARY`].rolloutState|[0]' --output text)
+        RUNNING_TD=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].taskDefinition' --output text)
+        echo "rolloutState=$STATE running=$RUNNING_TD"
+        # The circuit breaker may have rolled back to the previous revision: fail the pipeline then
+        [ "$STATE" = "COMPLETED" ] && [ "$RUNNING_TD" = "$NEW_TD" ]

@@ -1369,7 +1369,120 @@ Resources:
           TargetGroup1: !GetAtt ProductServiceTargetGroup.TargetGroupFullName
           TargetGroup2: !GetAtt ProductServiceTargetGroupGreen.TargetGroupFullName
 
+  # ---------------------------------------------------------------------------
+  # Exercise 12 (real-world project): Project 3's orders API as a second ECS service.
+  # Data: DynamoDB (as in Project 3). Identity: Cognito user pool; the service verifies the ID
+  # token itself (Project 3 used API Gateway's Cognito authorizer).
+  # ---------------------------------------------------------------------------
+  OrdersServiceRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: orders-service
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules": [{"rulePriority": 1, "description": "Keep the 10 most recent images",
+            "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 10},
+            "action": {"type": "expire"}}]}
+      Tags:
+        - Key: project
+          Value: containerized-microservices
+
+  # Same key schema as Project 3: one item per order line
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete       # test orders only
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${AWS::StackName}-orders'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: orderId, AttributeType: S }
+        - { AttributeName: itemId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: orderId, KeyType: HASH }
+        - { AttributeName: itemId, KeyType: RANGE }
+      SSESpecification:
+        SSEEnabled: true          # AWS-managed key aws/dynamodb
+      Tags:
+        - Key: project
+          Value: containerized-microservices
+
+  # Lite plan: no per-MAU charge within 10 000 MAU. No domain: user pools with a domain can't be
+  # used through the cognito-idp VPC endpoint (and no hosted UI is needed - CLI/API sign-in only).
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      UserPoolTier: LITE
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true   # no public self sign-up (as in Project 3)
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - { Name: verified_email, Priority: 1 }
+      UserPoolTags:
+        project: containerized-microservices
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: orders-cli
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      TokenValidityUnits: { IdToken: minutes, AccessToken: minutes }
+
+  # Free gateway endpoint: DynamoDB from the private subnets without NAT
+  DynamoDbGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  # The orders service fetches the user pool's signing keys (JWKS) through this endpoint.
+  # Only in private subnet B: the cognito-idp endpoint service isn't offered in us-east-1a (use1-az1)
+  # in this account ("does not support the availability zone"). Tasks in 1a use it across AZs.
+  CognitoIdpEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ComputeEnabled
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.cognito-idp
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
 Outputs:
+  OrdersServiceRepositoryUri:
+    Value: !GetAtt OrdersServiceRepository.RepositoryUri
+  OrdersTableName:
+    Value: !Ref OrdersTable
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
   ProductServiceRepositoryUri:
     Description: Image URI prefix for docker tag/push
     Value: !GetAtt ProductServiceRepository.RepositoryUri

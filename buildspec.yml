@@ -17,7 +17,7 @@ phases:
   pre_build:
     on-failure: ABORT
     commands:
-      - python -m pytest -q
+      - python -m pytest -q services/product-service/tests tests   # this service only; orders has its own pipeline
       - TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:7}
       - IMAGE_URI=$REPOSITORY_URI:$TAG
       - aws ecr get-login-password | docker login --username AWS --password-stdin ${REPOSITORY_URI%%/*}

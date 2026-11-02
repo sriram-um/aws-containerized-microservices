@@ -1,0 +1,6 @@
+# Only requirements.txt and orders_service/ are needed in the build context
+*
+!requirements.txt
+!orders_service/
+**/__pycache__
+**/*.pyc
