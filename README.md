@@ -13,7 +13,7 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 | **Runtime** | Python 3.12, FastAPI + uvicorn, psycopg 3; container on port 3000, arm64 (Graviton) |
 | **Regions** | us-east-1 (primary), us-west-2 (Aurora Global Database secondary) |
 | **CI/CD** | AWS CodePipeline (GitHub via CodeConnections) → CodeBuild → CodeDeploy ECS blue/green |
-| **Status** | 🚧 In progress |
+| **Status** | **Decommissioned** on 2026-11-01 (all resources deleted in both Regions, see [Phase 13](#phase-13--teardown-and-decommissioning-2026-11-01)) |
 
 ## Progress
 
@@ -32,7 +32,7 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 | 10 | Disaster recovery | Aurora Global Database | ✅ Done |
 | 11 | Cost estimate | AWS Pricing Calculator | ✅ Done ([docs/cost-estimate.md](docs/cost-estimate.md)) |
 | 12 | Real-world project | Orders service (Project 3) on ECS | ✅ Done |
-| 13 | Close-out | Teardown (Well-Architected review: see Phase 13) | ⏳ Next |
+| 13 | Close-out | Teardown ✅ (Well-Architected review: not done yet, see Phase 13) | 🟡 |
 
 ## Process
 
@@ -1142,6 +1142,45 @@ is mostly the network around it (ALB, endpoints), not the containers.
 **Costs added:** `cognito-idp` endpoint (1 AZ) $0.01/h, 2 Fargate tasks ≈ $0.013/h, DynamoDB
 on-demand and Cognito Lite: cents. Running total ≈ **$0.29/h**.
 
+### Phase 13 — Teardown and decommissioning (2026-11-01)
+
+Everything was deleted at the end of the project with [`scripts/teardown.sh`](scripts/teardown.sh)
+(`--yes` required; idempotent, so it can simply be re-run after a partial failure).
+
+**Order**
+
+| Step | What | Why this order |
+|---|---|---|
+| 1 | `remove-from-global-cluster` for the us-west-2 secondary (55 s), then delete the `-dr` stack (11 min) | A secondary cluster can't be deleted while it is a global-cluster member |
+| 2 | Detach the us-east-1 primary (53 s) | Then the `AWS::RDS::GlobalCluster` is empty and CloudFormation can delete it |
+| 3 | Empty the artifact bucket, delete the ALB listeners, delete the main stack | CloudFormation can't delete non-empty buckets; listeners: see the issue below |
+| 4 | Empty the template bucket, delete the bootstrap stack | It held the staged templates |
+| 5 | Delete what CloudFormation doesn't own | Pull-through cache repo `ecr-public/aws-observability/aws-otel-collector`, Container Insights log group, **all 23 task definition revisions** (deregister + delete; revisions 1-14 still contained the old Phase 3 password), leftover log groups and secrets |
+| 6 | Verify | No stacks, clusters, snapshots, buckets, repos, log groups, roles, endpoints, load balancers, pipelines, connections, tables or secrets in us-east-1 or us-west-2 |
+
+**Issues hit and fixes**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Main stack `DELETE_FAILED`: `Target group … is currently in use by a listener or a rule` (`ProductServiceTargetGroupGreen`) | CodeDeploy had switched :80 to target group 2 (drift CloudFormation doesn't know), so CloudFormation deleted that target group before the listener that actually used it | Delete the ALB listeners first; the re-run deleted the rest in 35 s |
+| Re-run aborted right after "empty s3://…" | The artifact bucket was already gone; `aws s3 rm` failed under `set -e` | Check `head-bucket` first |
+| Re-run aborted silently (exit 254) | `describe-load-balancers` for the deleted ALB failed inside `$(…)` with `pipefail` | `|| true` for lookups of things that may already be gone |
+| Tagging API still listed 37 resources (VPC endpoints, user pools, ECS tasks/services, task definitions) | The Resource Groups Tagging API lags behind deletions | Checked each one: all `NotFound` / `INACTIVE` |
+
+**Deliberately left**
+
+| Item | Why | Cost |
+|---|---|---|
+| Log group `aws/spans` | Account-wide CloudWatch Transaction Search, shared with other projects; 10.6 MB, 30-day retention | ≈ $0.0003/month, expires by itself |
+| AWS Connector for GitHub installation on `sriram-um` | GitHub-side; harmless without a connection | none; uninstall in GitHub → Settings → Applications if not needed |
+| Cost-allocation tag `project` | Inactive; activating it is an account-level billing choice | none |
+
+**Not done:** the Well-Architected review (playbook §10) and the teardown → rebuild → teardown
+proof. The review needs no running resources (template, README measurements and cost estimate are
+the evidence) and can be done later at no cost. A rebuild would need, in this order: bootstrap
+bucket, main stack with `EnableCompute=false EnableDatabase=false`, `push_image.sh` for both
+services, then both toggles on, the secondary stack, the seed task and one run of each pipeline.
+
 ## Repository layout
 
 ```
@@ -1149,7 +1188,8 @@ template.yaml                    CloudFormation: one stack, extended per exercis
 buildspec.yml  appspec.yaml       CodeBuild / CodeDeploy (exercise 6)
 infra/deploy-bucket.yaml         bootstrap: S3 bucket that stages template.yaml
 infra/aurora-secondary.yaml      us-west-2 stack: Aurora Global Database secondary (exercise 10)
-scripts/                         lib.sh (identity guard), deploy.sh, push_image.sh, run_task.sh, render_taskdef.py,
+scripts/                         lib.sh (identity guard), deploy.sh, deploy_secondary.sh, push_image.sh, run_task.sh,
+                                 render_taskdef.py, dr_drill.py, orders_e2e.py, teardown.sh,
                                  load_test.py, check_dashboard.py
 docs/                            load-test CSVs, dashboard images, cost estimate (later)
 requirements-scripts.txt         boto3 for the scripts
@@ -1243,3 +1283,7 @@ scripts/push_image.sh      # build arm64 image, tag with the git SHA, push to EC
 - **Design for the switchover blip:** the app returned fast `503`s and recovered by itself because
   `/health` ignores the database (Phase 1). With a DB-dependent health check, ECS would have killed
   and replaced every task during the 45-second role change.
+- **Teardown is part of the design:** CodeDeploy's listener swaps, the global database's
+  membership and resources created by AWS on first use (cache repository, Container Insights log
+  group, task definition revisions) all needed explicit steps. A scripted, re-runnable teardown
+  found and fixed them; the account is back to zero for this project.

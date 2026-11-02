@@ -49,7 +49,10 @@ empty_bucket() {  # stack output-key
   local b
   b=$(aws cloudformation describe-stacks --region us-east-1 --stack-name "$1" \
         --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text 2>/dev/null | tr -d '\r')
-  [[ -n "$b" && "$b" != "None" ]] && { echo "$(ts) empty s3://$b"; aws s3 rm "s3://$b" --recursive --quiet; }
+  # The bucket may already be gone (a re-run after a partly failed delete): don't abort then
+  if [[ -n "$b" && "$b" != "None" ]] && aws s3api head-bucket --bucket "$b" >/dev/null 2>&1; then
+    echo "$(ts) empty s3://$b"; aws s3 rm "s3://$b" --recursive --quiet
+  fi
 }
 
 # 1. Secondary Region
@@ -59,6 +62,14 @@ delete_stack "$STACK_NAME-dr" us-west-2
 # 2. Primary Region
 detach "$PRIMARY_ARN" us-east-1
 empty_bucket "$STACK_NAME" ArtifactBucketName
+# CodeDeploy swapped the listeners' target groups (drift CloudFormation doesn't know about). Deleting
+# the listeners first avoids "target group ... is currently in use by a listener" (first teardown).
+ALB=$(aws elbv2 describe-load-balancers --names "$STACK_NAME-alb" --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null | tr -d '\r' || true)
+if [[ -n "$ALB" && "$ALB" != "None" ]]; then
+  for l in $(aws elbv2 describe-listeners --load-balancer-arn "$ALB" --query 'Listeners[].ListenerArn' --output text | tr -d '\r'); do
+    echo "$(ts) delete listener ${l##*/}"; aws elbv2 delete-listener --listener-arn "$l"
+  done
+fi
 delete_stack "$STACK_NAME" us-east-1
 empty_bucket "$STACK_NAME-deploy-bucket" TemplateBucketName
 delete_stack "$STACK_NAME-deploy-bucket" us-east-1
