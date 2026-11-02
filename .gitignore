@@ -6,3 +6,6 @@ __pycache__/
 .env
 .playwright-mcp/
 load_test_results*.csv
+
+# Well-Architected PDF reports contain private account findings - keep local
+well-architected-review/reports/*.pdf

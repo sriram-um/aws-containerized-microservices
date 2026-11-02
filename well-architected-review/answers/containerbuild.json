@@ -1,0 +1,176 @@
+{
+  "lens": "containerbuild",
+  "reviewed": "2026-11-01",
+  "scope": "Pillars security, reliability, performance, costOptimization; operational excellence and sustainability not reviewed (by request)",
+  "evidenceBase": "https://github.com/sriram-um/aws-containerized-microservices (main @ 8aae8bd: the architecture as built, before decommissioning) + read-only checks of account 977534234172 on 2026-11-01",
+  "questions": {
+    "COST1": {
+      "title": "How do you design your container build process to avoid unnecessary cost?",
+      "selected": [
+        "COST1_1",
+        "COST1_2",
+        "COST1_3"
+      ],
+      "notes": "Evidence: ECR lifecycle policies (keep 10 images, expire untagged after 1 day); multi-stage builds; native ARM CodeBuild (21 s vs 365 s emulated) with local Docker layer cache; requirements.txt holds production dependencies only (dev dependencies separate).\nGap: No shared internal base image for common dependencies (each service installs its own)."
+    },
+    "COST2": {
+      "title": "Ensure that your container images contain only what is relevant for your application to run",
+      "selected": [
+        "COST2_1",
+        "COST2_2"
+      ],
+      "notes": "Evidence: Start-up measured (Fargate created->running 32-35 s); no volumes, read-only root filesystem, only the venv and the app code in the image (54-75 MB).\nGap: None significant."
+    },
+    "COST3": {
+      "title": "How do you reduce your container images size?",
+      "selected": [
+        "COST3_1"
+      ],
+      "notes": "Evidence: Multi-stage Dockerfile: the runtime stage adds 3 layers to the base (user, venv, code); a naive single-stage build added 33 MB vs 11 MB (Phase 1).\nGap: None significant."
+    },
+    "COST4": {
+      "title": "How do you design your containerized application to support automatic scaling and graceful termination?",
+      "selected": [
+        "COST4_1"
+      ],
+      "notes": "Evidence: Exec-form CMD, so uvicorn is PID 1 and receives SIGTERM; graceful stop measured (1.9 s locally, 0.1 s in ECS after ALB draining; Spot simulation 453/453 ok); target tracking scaling.\nGap: None significant."
+    },
+    "COST5": {
+      "title": "How do you design your containerized application to support multiple CPU architectures?",
+      "selected": [
+        "COST5_1"
+      ],
+      "notes": "Evidence: Deliberately built for arm64/Graviton (buildx --platform linux/arm64, ARM CodeBuild, RuntimePlatform ARM64) after comparing price/performance; local amd64 builds for development.\nGap: Images are single-architecture (no multi-arch manifest), so an x86 fallback would need a rebuild."
+    },
+    "COST6": {
+      "title": "How do you minimize cost for your containerized application during startup time?",
+      "selected": [
+        "COST6_1"
+      ],
+      "notes": "Evidence: Connection pool opened without waiting for the DB, JWKS fetched lazily and cached, slim image; Fargate image pull 3.7-4.6 s for 57 MB.\nGap: Image lazy loading (SOCI) not evaluated."
+    },
+    "COST7": {
+      "title": "What systems are you using to create your container build process?",
+      "selected": [
+        "COST7_1"
+      ],
+      "notes": "Evidence: CodePipeline V2 + CodeBuild (ARM) per service, path-filtered triggers, immutable SHA tags.\nGap: None significant."
+    },
+    "PERF1": {
+      "title": "How do you reduce the size of your container image?",
+      "selected": [
+        "PERF1_1",
+        "PERF1_2",
+        "PERF1_3"
+      ],
+      "notes": "Evidence: python:3.12-slim base; one process per container (uvicorn; the ADOT collector is a separate sidecar); allow-list .dockerignore (only requirements.txt and the package).\nGap: Distroless/minimal bases not evaluated."
+    },
+    "PERF2": {
+      "title": "How do you reduce the pull time of your container image?",
+      "selected": [
+        "PERF2_1"
+      ],
+      "notes": "Evidence: ECR in the same Region via VPC endpoints; the collector image via an ECR pull-through cache instead of public.ecr.aws.\nGap: None significant."
+    },
+    "PERF3": {
+      "title": "How do you make sure to get consistent results for your target images?",
+      "selected": [
+        "PERF3_1"
+      ],
+      "notes": "Evidence: Images tagged with the git SHA in IMMUTABLE repositories; base image pinned to 3.12.16-slim-trixie (digest checked identical across registries); dependency versions pinned.\nGap: The base image is pinned by tag, not by digest."
+    },
+    "PERF4": {
+      "title": "How do you make sure to use updated versions for parent images?",
+      "selected": [
+        "PERF4_no"
+      ],
+      "notes": "Evidence: Base image version pinned and documented; HIGH CVEs re-checked manually.\nGap: No notification or automation when the parent image or its packages are updated (no EventBridge/Inspector/Dependabot trigger)."
+    },
+    "PERF5": {
+      "title": "How do you make sure you get consistent performance results over time?",
+      "selected": [
+        "PERF5_no"
+      ],
+      "notes": "Evidence: Load tests (scripts/load_test.py) with results kept as CSV in docs/.\nGap: Performance tests are manual and not part of the pipeline; no regression thresholds."
+    },
+    "PERF6": {
+      "title": "How do you optimize the size of your target image?",
+      "selected": [
+        "PERF6_1",
+        "PERF6_2"
+      ],
+      "notes": "Evidence: CodeBuild LOCAL_DOCKER_LAYER_CACHE + LOCAL_SOURCE_CACHE; ARM64 Graviton selected for price/performance (Fargate ARM $0.03238/vCPU-h vs x86 $0.04048).\nGap: None significant."
+    },
+    "REL1": {
+      "title": "How do you limit the amount of CPU and memory a container consumes?",
+      "selected": [
+        "REL1_1"
+      ],
+      "notes": "Evidence: Task-level 256 CPU units / 512 MiB; collector sidecar limited to 64 CPU units / 128 MiB hard, 64 MiB soft.\nGap: None significant."
+    },
+    "REL2": {
+      "title": "How do you handle persistent data in a container application?",
+      "selected": [],
+      "notes": "Evidence: Containers are stateless; all persistent data lives in Aurora and DynamoDB, and the root filesystem is read-only.\nGap: None.",
+      "not_applicable": "ARCHITECTURE_CONSTRAINTS"
+    },
+    "REL3": {
+      "title": "How do you automate building and testing of containers?",
+      "selected": [
+        "REL3_1"
+      ],
+      "notes": "Evidence: Local: docker compose with Postgres plus an optional local ADOT collector for span checks; pytest (moto, local JWKS keys); CI runs the same tests before every image build.\nGap: No dedicated test/staging environment in the pipeline (tests run in CodeBuild, then straight to production with a canary)."
+    },
+    "REL4": {
+      "title": "How do I cascade updates to a parent or base image?",
+      "selected": [
+        "REL4_1",
+        "REL4_3"
+      ],
+      "notes": "Evidence: Both services use the same pinned parent image (ECR Public mirror of python:3.12.16-slim-trixie); Dockerfiles and all images are under source control, images tagged with the commit SHA.\nGap: No image hierarchy (no organization base image built once and inherited) and no automatic rebuild when the parent changes."
+    },
+    "REL5": {
+      "title": "How do you monitor the health of a container?",
+      "selected": [
+        "REL5_1"
+      ],
+      "notes": "Evidence: Dockerfile HEALTHCHECK; task definition health checks (app /health without DB dependency, collector /healthcheck); ALB target health on /health; unhealthy tasks are replaced by ECS.\nGap: None significant."
+    },
+    "SEC1": {
+      "title": "How do you ensure that your container images are using least privilege identity?",
+      "selected": [
+        "SEC1_1"
+      ],
+      "notes": "Evidence: USER app (uid/gid 10001, no login shell) in both Dockerfiles; read-only root filesystem.\nGap: None significant."
+    },
+    "SEC2": {
+      "title": "How do you control access to your build infrastructure?",
+      "selected": [
+        "SEC2_no"
+      ],
+      "notes": "Evidence: CodeBuild and CodePipeline roles are scoped to their repositories, buckets, log group and services; no long-lived credentials in the pipeline.\nGap: The only human identity has AdministratorAccess without MFA, so administrator access to the build infrastructure is not limited."
+    },
+    "SEC3": {
+      "title": "How do you detect and address vulnerabilities within your container image?",
+      "selected": [
+        "SEC3_1"
+      ],
+      "notes": "Evidence: ECR scan on push for every image; findings reviewed and the decision documented (Phase 2).\nGap: Basic (OS-only) scanning; no Inspector enhanced scanning; no gate that blocks images with critical findings."
+    },
+    "SEC4": {
+      "title": "How do you manage your container image boundaries?",
+      "selected": [
+        "SEC4_1"
+      ],
+      "notes": "Evidence: Minimal attack surface: slim base, no compilers, pip removed, non-root user, read-only filesystem, only port 3000 exposed, no shell access/ECS Exec.\nGap: Lineage is not recorded: provenance/SBOM attestations were disabled to keep a single manifest; no image signing."
+    },
+    "SEC5": {
+      "title": "How do you handle data within your containerized applications?",
+      "selected": [
+        "SEC5_1",
+        "SEC5_2"
+      ],
+      "notes": "Evidence: No secrets in images or the repo (Secrets Manager valueFrom, secret scans before commits); persistent data outside the containers (Aurora, DynamoDB).\nGap: None significant."
+    }
+  }
+}

@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Well-Architected review — aws-containerized-microservices</title>
+<style>
+body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+       line-height: 1.6; color: #1f2328; max-width: 980px; margin: 0 auto; padding: 2rem 1.5rem; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { border-bottom: 2px solid #ff9900; padding-bottom: .3em; }
+h2 { border-bottom: 1px solid #d0d7de; padding-bottom: .3em; margin-top: 2em; }
+a { color: #0969da; text-decoration: none; } a:hover { text-decoration: underline; }
+code { background: #f3f4f6; padding: .1em .35em; border-radius: 4px; font-size: 90%; }
+pre { background: #161b22; color: #e6edf3; padding: 1em; border-radius: 6px; overflow-x: auto; }
+pre code { background: none; padding: 0; color: inherit; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; display: block; overflow-x: auto; }
+th, td { border: 1px solid #d0d7de; padding: .45em .7em; vertical-align: top; text-align: left; }
+th { background: #f6f8fa; }
+tr:nth-child(even) td { background: #fafbfc; }
+blockquote { margin: 1em 0; padding: .5em 1em; border-left: 4px solid #ff9900; background: #fff8ec; }
+blockquote p { margin: .3em 0; }
+img { max-width: 100%; border: 1px solid #d0d7de; border-radius: 4px; }
+footer { margin-top: 3em; font-size: 85%; color: #656d76; border-top: 1px solid #d0d7de; padding-top: 1em; }
+</style>
+</head>
+<body>
+<h1 id="well-architected-review-aws-containerized-microservices">Well-Architected review — aws-containerized-microservices</h1>
+<p>AWS Well-Architected review of this repository's architecture as built (before it was
+decommissioned), with the <strong>Well-Architected Framework</strong> lens and the <strong>Container Build Lens</strong>,
+for the pillars <strong>Security, Reliability (incl. disaster recovery), Performance Efficiency and
+Cost Optimization</strong>.</p>
+<p><strong>Result (milestone <code>v1.0-baseline</code>, 2026-11-01):</strong> Framework 40 questions: 17 high, 12 medium,
+11 no risk. Container Build Lens 23 questions: 1 high, 6 medium, 15 no risk, 1 not applicable.
+Most high risks are account-level (root access key, no MFA, no CloudTrail/GuardDuty) or
+production gaps (HTTP only, no notifications, recovery objectives not defined).</p>
+<h2 id="read">Read</h2>
+<table>
+<thead>
+<tr>
+<th>Document</th>
+<th>What it is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="02-review-results.html">Review results</a></td>
+<td>Scope, risk counts, strengths, high risks by theme (incl. DR), improvement plan with costs, accepted risks, every question</td>
+</tr>
+<tr>
+<td><a href="https://github.com/sriram-um/aws-serverless-application/blob/main/well-architected-review/01-how-to-do-a-review.md">How to do a review</a></td>
+<td>The process guide from Project 3; this review used the same method and scripts</td>
+</tr>
+</tbody>
+</table>
+<h2 id="folder-layout">Folder layout</h2>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://github.com/sriram-um/aws-containerized-microservices/blob/main/well-architected-review/answers/"><code>answers/</code></a></td>
+<td>Answers as code: per question the selected best practices and notes with <em>Evidence</em> and <em>Gap</em> (<code>wellarchitected.json</code>, <code>containerbuild.json</code>) plus the tool's full question lists</td>
+</tr>
+<tr>
+<td><a href="https://github.com/sriram-um/aws-containerized-microservices/blob/main/well-architected-review/scripts/wa_review.py"><code>scripts/wa_review.py</code></a></td>
+<td>Creates the workload, pushes the answers, saves milestones, prints risk counts, downloads reports (adapted from Project 3: the Container Build Lens is addressed by ARN)</td>
+</tr>
+<tr>
+<td><a href="https://github.com/sriram-um/aws-containerized-microservices/blob/main/well-architected-review/scripts/risk_chart.py"><code>scripts/risk_chart.py</code></a></td>
+<td>Draws <a href="images/baseline-risks.png"><code>images/baseline-risks.png</code></a> from <code>reports/baseline-risks.json</code></td>
+</tr>
+<tr>
+<td><a href="https://github.com/sriram-um/aws-containerized-microservices/blob/main/well-architected-review/scripts/build_html.py"><code>scripts/build_html.py</code></a></td>
+<td>Regenerates the HTML versions of the Markdown files</td>
+</tr>
+<tr>
+<td><a href="https://github.com/sriram-um/aws-containerized-microservices/blob/main/well-architected-review/reports/"><code>reports/</code></a></td>
+<td><code>baseline-risks.json</code> (per-question risks). The official PDF reports are written here but git-ignored: they include account findings</td>
+</tr>
+</tbody>
+</table>
+<h2 id="re-run">Re-run</h2>
+<pre><code class="language-bash">.venv/Scripts/python well-architected-review/scripts/wa_review.py apply      # push answers/*.json
+.venv/Scripts/python well-architected-review/scripts/wa_review.py status
+.venv/Scripts/python well-architected-review/scripts/wa_review.py milestone v1.1-&lt;name&gt;
+.venv/Scripts/python well-architected-review/scripts/wa_review.py report v1.1
+.venv/Scripts/python well-architected-review/scripts/risk_chart.py v1.1 --pillars security,reliability,performance,costOptimization
+</code></pre>
+<p>The workload in the Well-Architected Tool (<code>aws-containerized-microservices</code>, us-east-1) is free
+and stays as the record of the review.</p>
+<footer>Generated from <a href="https://github.com/sriram-um/aws-containerized-microservices/blob/main/well-architected-review/README.md">README.md</a> · <a href="https://github.com/sriram-um/aws-containerized-microservices">sriram-um/aws-containerized-microservices</a></footer>
+</body>
+</html>

@@ -1,0 +1,616 @@
+[
+  {
+    "pillar": "costOptimization",
+    "questionId": "COST1",
+    "title": "How do you design your container build process to avoid unnecessary cost?",
+    "description": "Designing an efficient container build process avoids unnecessary costs by optimizing image size, leveraging caching, parallelizing builds, and preventing resource waste.",
+    "choices": [
+      {
+        "choiceId": "COST1_1",
+        "title": "Define retention period of container images",
+        "description": ""
+      },
+      {
+        "choiceId": "COST1_2",
+        "title": "Designing efficient container build process",
+        "description": ""
+      },
+      {
+        "choiceId": "COST1_3",
+        "title": "Application dependencies",
+        "description": ""
+      },
+      {
+        "choiceId": "COST1_4",
+        "title": "Common container image dependencies",
+        "description": ""
+      },
+      {
+        "choiceId": "COST1_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "costOptimization",
+    "questionId": "COST2",
+    "title": "Ensure that your container images contain only what is relevant for your application to run",
+    "description": "It is important to only include relevant components in container images to optimize image size, improve security by reducing attack surface, and simplify maintenance and debugging.",
+    "choices": [
+      {
+        "choiceId": "COST2_1",
+        "title": "Containerized application start-up time",
+        "description": ""
+      },
+      {
+        "choiceId": "COST2_2",
+        "title": "Storage requirements for containers",
+        "description": ""
+      },
+      {
+        "choiceId": "COST2_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "costOptimization",
+    "questionId": "COST3",
+    "title": "How do you reduce your container images size?",
+    "description": "Reducing container image size improves startup time, decreases storage resource requirements, and limits the attack surface for improved security.",
+    "choices": [
+      {
+        "choiceId": "COST3_1",
+        "title": "Reducing image layers",
+        "description": ""
+      },
+      {
+        "choiceId": "COST3_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "costOptimization",
+    "questionId": "COST4",
+    "title": "How do you design your containerized application to support automatic scaling and graceful termination?",
+    "description": "Designing containerized applications to support automatic scaling and graceful termination enables the application to dynamically respond to changes in demand and infrastructure availability, improving reliability and efficiency.",
+    "choices": [
+      {
+        "choiceId": "COST4_1",
+        "title": "Does your application handle signal handling?",
+        "description": ""
+      },
+      {
+        "choiceId": "COST4_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "costOptimization",
+    "questionId": "COST5",
+    "title": "How do you design your containerized application to support multiple CPU architectures?",
+    "description": "Supporting multiple CPU architectures in a containerized application provides portability and flexibility to run the application across different infrastructure environments.",
+    "choices": [
+      {
+        "choiceId": "COST5_1",
+        "title": "Aware of different instance families and CPU architecture",
+        "description": ""
+      },
+      {
+        "choiceId": "COST5_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "costOptimization",
+    "questionId": "COST6",
+    "title": "How do you minimize cost for your containerized application during startup time?",
+    "description": "Minimizing cost during startup time for a containerized application is important because containers are often cycled rapidly, so optimizing startup resource usage reduces unnecessary infrastructure and operational expenses.",
+    "choices": [
+      {
+        "choiceId": "COST6_1",
+        "title": "Minimise container startup time at application or container level",
+        "description": ""
+      },
+      {
+        "choiceId": "COST6_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "costOptimization",
+    "questionId": "COST7",
+    "title": "What systems are you using to create your container build process?",
+    "description": "It is important to have automated systems to create the container build process because this streamlines container image creation, enables consistency and reproducibility of the build, and allows seamless implementation of updates and modifications.",
+    "choices": [
+      {
+        "choiceId": "COST7_1",
+        "title": "Have a system in place for container build process",
+        "description": ""
+      },
+      {
+        "choiceId": "COST7_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "operationalExcellence",
+    "questionId": "OPS1",
+    "title": "How do you manage the lifecycle of your containers and images?",
+    "description": "It is important to adopt proper standards and tools to manage the lifecycle of container images from development to production deployment.",
+    "choices": [
+      {
+        "choiceId": "OPS1_1",
+        "title": "Understand the lineage of your container image",
+        "description": ""
+      },
+      {
+        "choiceId": "OPS1_2",
+        "title": "Have parity between your deployment environments",
+        "description": ""
+      },
+      {
+        "choiceId": "OPS1_3",
+        "title": "Build the image once and use the same image in all environments",
+        "description": ""
+      },
+      {
+        "choiceId": "OPS1_4",
+        "title": "Use a CI/CD build process",
+        "description": ""
+      },
+      {
+        "choiceId": "OPS1_5",
+        "title": "Multi-stage builds",
+        "description": ""
+      },
+      {
+        "choiceId": "OPS1_6",
+        "title": "Implement a minimal container image design to achieve your business and security objectives",
+        "description": ""
+      },
+      {
+        "choiceId": "OPS1_7",
+        "title": "Using package managers to deploy your containerized applications",
+        "description": ""
+      },
+      {
+        "choiceId": "OPS1_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "operationalExcellence",
+    "questionId": "OPS2",
+    "title": "How do you know whether your containerized workload is achieving its business goals?",
+    "description": "To ensure the success of your running container, you must understand the health of your containerized workload as well as what your customers are experiencing when they interact with your application.",
+    "choices": [
+      {
+        "choiceId": "OPS2_1",
+        "title": "Implement health checks to determine container state",
+        "description": ""
+      },
+      {
+        "choiceId": "OPS2_2",
+        "title": "Have your logs available outside the running container",
+        "description": ""
+      },
+      {
+        "choiceId": "OPS2_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "performance",
+    "questionId": "PERF1",
+    "title": "How do you reduce the size of your container image?",
+    "description": "Smaller container images directly improve performance related to pulling, deploying, caching, storage usage, security, and migrating containers.",
+    "choices": [
+      {
+        "choiceId": "PERF1_1",
+        "title": "Use small parent images",
+        "description": ""
+      },
+      {
+        "choiceId": "PERF1_2",
+        "title": "Run a single process per container",
+        "description": ""
+      },
+      {
+        "choiceId": "PERF1_3",
+        "title": "Exclude files with from your build process",
+        "description": ""
+      },
+      {
+        "choiceId": "PERF1_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "performance",
+    "questionId": "PERF2",
+    "title": "How do you reduce the pull time of your container image?",
+    "description": "Optimizing pull performance through smaller images, layer caching, geographically closer registries, and other best practices is key for achieving faster deployments, rapid scaling, quicker failure recovery, and a better developer experience.",
+    "choices": [
+      {
+        "choiceId": "PERF2_1",
+        "title": "Use a container registry close to your cluster",
+        "description": ""
+      },
+      {
+        "choiceId": "PERF2_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "performance",
+    "questionId": "PERF3",
+    "title": "How do you make sure to get consistent results for your target images?",
+    "description": "Getting consistent results for target images ensures predictable behavior, avoids unexpected errors due to inconsistencies, and simplifies troubleshooting when issues arise.",
+    "choices": [
+      {
+        "choiceId": "PERF3_1",
+        "title": "Use a tag other than latest",
+        "description": ""
+      },
+      {
+        "choiceId": "PERF3_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "performance",
+    "questionId": "PERF4",
+    "title": "How do you make sure to use updated versions for parent images?",
+    "description": "Using updated versions for parent images ensures you have the latest security patches, bug fixes, and compatibility with dependencies, reducing vulnerabilities and improving stability and reliability.",
+    "choices": [
+      {
+        "choiceId": "PERF4_1",
+        "title": "Implement a notification mechanism for updated parent images",
+        "description": ""
+      },
+      {
+        "choiceId": "PERF4_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "performance",
+    "questionId": "PERF5",
+    "title": "How do you make sure you get consistent performance results over time?",
+    "description": "Getting consistent performance over time for a container image allows for predictable resource planning and workload deployments, avoiding unexpected behavior that could impact reliability or cause outages.",
+    "choices": [
+      {
+        "choiceId": "PERF5_1",
+        "title": "Implement an automated performance testing strategy",
+        "description": ""
+      },
+      {
+        "choiceId": "PERF5_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "performance",
+    "questionId": "PERF6",
+    "title": "How do you optimize the size of your target image?",
+    "description": "Optimizing the size of the target container image improves pull and deployment speed, reduces storage resource usage, enables faster scaling, and lowers the security attack surface.",
+    "choices": [
+      {
+        "choiceId": "PERF6_1",
+        "title": " Use caching during build",
+        "description": ""
+      },
+      {
+        "choiceId": "PERF6_2",
+        "title": "Use the CPU architecture with best price to performance ratio",
+        "description": ""
+      },
+      {
+        "choiceId": "PERF6_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "reliability",
+    "questionId": "REL1",
+    "title": "How do you limit the amount of CPU and memory a container consumes?",
+    "description": "Whatever container orchestrator you are using, specifying resource requests and limits for your containerized applications is highly critical.",
+    "choices": [
+      {
+        "choiceId": "REL1_1",
+        "title": "Use RAM and CPU limits",
+        "description": ""
+      },
+      {
+        "choiceId": "REL1_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "reliability",
+    "questionId": "REL2",
+    "title": "How do you handle persistent data in a container application?",
+    "description": "Given the ephemeral nature of a container workload, data on the container will be lost once the container is restarted and longer exists. For this reason, handling persistent data properly in a container application is crucial.",
+    "choices": [
+      {
+        "choiceId": "REL2_1",
+        "title": "Use volumes to persist data",
+        "description": ""
+      },
+      {
+        "choiceId": "REL2_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "reliability",
+    "questionId": "REL3",
+    "title": "How do you automate building and testing of containers?",
+    "description": "Being able to build and test your containerized application using automated tools can speed up the development phase and reduce the time to market.",
+    "choices": [
+      {
+        "choiceId": "REL3_1",
+        "title": "Create local testing processes",
+        "description": ""
+      },
+      {
+        "choiceId": "REL3_2",
+        "title": "Design your testing environments to support your container build pipeline",
+        "description": ""
+      },
+      {
+        "choiceId": "REL3_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "reliability",
+    "questionId": "REL4",
+    "title": "How do I cascade updates to a parent or base image?",
+    "description": "Managing updates in a proper way helps maintain consistent change management process and security posture.",
+    "choices": [
+      {
+        "choiceId": "REL4_1",
+        "title": "Create a standardized parent image",
+        "description": ""
+      },
+      {
+        "choiceId": "REL4_2",
+        "title": "Use an image hierarchy approach",
+        "description": ""
+      },
+      {
+        "choiceId": "REL4_3",
+        "title": "Use source control and tagging on all container images",
+        "description": ""
+      },
+      {
+        "choiceId": "REL4_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "reliability",
+    "questionId": "REL5",
+    "title": "How do you monitor the health of a container?",
+    "description": "Monitoring the health of a container is crucial to ensure the availability of the services and business continuity.",
+    "choices": [
+      {
+        "choiceId": "REL5_1",
+        "title": "Plan for health checks in all containers builds and deployments",
+        "description": ""
+      },
+      {
+        "choiceId": "REL5_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "security",
+    "questionId": "SEC1",
+    "title": "How do you ensure that your container images are using least privilege identity?",
+    "description": "When the processes inside the container are running as the root user, not only do they have full administrative access to containers, they also have the same administrative level access to the container host. Having an application running within a container through the root user expands the attack surface of the environment.",
+    "choices": [
+      {
+        "choiceId": "SEC1_1",
+        "title": "Define the user directive in the Dockerfile used to compile the image",
+        "description": ""
+      },
+      {
+        "choiceId": "SEC1_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "security",
+    "questionId": "SEC2",
+    "title": "How do you control access to your build infrastructure?",
+    "description": "Securing build pipelines is a major focus for organizations moving to a DevSecOps strategy.",
+    "choices": [
+      {
+        "choiceId": "SEC2_1",
+        "title": "Limit administrator access to build infrastructure (CI pipeline)",
+        "description": ""
+      },
+      {
+        "choiceId": "SEC2_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "security",
+    "questionId": "SEC3",
+    "title": "How do you detect and address vulnerabilities within your container image?",
+    "description": "After images are built, it is important to maintain a regular cadence of scanning those images to ensure no new or existing vulnerabilities have surfaced.",
+    "choices": [
+      {
+        "choiceId": "SEC3_1",
+        "title": "Ensure that your images are scanned for vulnerabilities",
+        "description": ""
+      },
+      {
+        "choiceId": "SEC3_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "security",
+    "questionId": "SEC4",
+    "title": "How do you manage your container image boundaries?",
+    "description": "In the context of container workloads, infrastructure protection is often a topic with respect to the container as a vector to access the underlying compute infrastructure. It is also important to understand where your container images are coming from.",
+    "choices": [
+      {
+        "choiceId": "SEC4_1",
+        "title": "Minimize attack surface",
+        "description": ""
+      },
+      {
+        "choiceId": "SEC4_2",
+        "title": "Understand the lineage of your container image",
+        "description": ""
+      },
+      {
+        "choiceId": "SEC4_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "security",
+    "questionId": "SEC5",
+    "title": "How do you handle data within your containerized applications?",
+    "description": "With respect to handling data in the build and design of the container, it is important that no sensitive information is stored in the container itself. Also, if your containerized application writes or consumes persistent data, ensure that data is stored outside of the container.",
+    "choices": [
+      {
+        "choiceId": "SEC5_1",
+        "title": "Do not hardcode sensitive data into your container image",
+        "description": ""
+      },
+      {
+        "choiceId": "SEC5_2",
+        "title": "Ensure that persistent data is stored outside of the container",
+        "description": ""
+      },
+      {
+        "choiceId": "SEC5_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "sustainability",
+    "questionId": "SUS1",
+    "title": "How do you design your containerized application to reduce resources?",
+    "description": "It is important to design containerized applications to reduce resource usage because containers share resources on a host system, so minimizing CPU, memory, storage, and network usage allows more containers to run efficiently on the same infrastructure.",
+    "choices": [
+      {
+        "choiceId": "SUS1_1",
+        "title": "Design containerized applications that it reduces underlying resources",
+        "description": ""
+      },
+      {
+        "choiceId": "SUS1_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "sustainability",
+    "questionId": "SUS2",
+    "title": "How do you support your containerized application to run on energy-efficient hardware?",
+    "description": "It is crucial for containerized applications to support energy-efficient hardware because running on lower-power CPUs, SSDs, and memory can reduce energy costs and environmental impact for large-scale container deployments.",
+    "choices": [
+      {
+        "choiceId": "SUS2_1",
+        "title": "Use instance types with least impact",
+        "description": ""
+      },
+      {
+        "choiceId": "SUS2_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  },
+  {
+    "pillar": "sustainability",
+    "questionId": "SUS3",
+    "title": "How do you design your build tooling and services to improve efficiency?",
+    "description": "It is important to design efficient build tooling and services for containerized applications in order to optimize image creation speed, resource usage, and reproducibility, enabling rapid deployment and scaling of container-based systems.",
+    "choices": [
+      {
+        "choiceId": "SUS3_1",
+        "title": "Use dynamically created build servers for building your containerized workload ",
+        "description": ""
+      },
+      {
+        "choiceId": "SUS3_2",
+        "title": "Use pre-defined or built runtimes to reduce your build time, and reuse needed dependencies for the build process",
+        "description": ""
+      },
+      {
+        "choiceId": "SUS3_3",
+        "title": "Update your parent and base image regularly",
+        "description": ""
+      },
+      {
+        "choiceId": "SUS3_4",
+        "title": "Delete unused or obsolete container images",
+        "description": ""
+      },
+      {
+        "choiceId": "SUS3_no",
+        "title": "None of these",
+        "description": ""
+      }
+    ]
+  }
+]

@@ -1,0 +1,381 @@
+{
+  "lens": "wellarchitected",
+  "reviewed": "2026-11-01",
+  "scope": "Pillars security, reliability, performance, costOptimization; operational excellence and sustainability not reviewed (by request)",
+  "evidenceBase": "https://github.com/sriram-um/aws-containerized-microservices (main @ 8aae8bd: the architecture as built, before decommissioning) + read-only checks of account 977534234172 on 2026-11-01",
+  "questions": {
+    "securely-operate": {
+      "title": "How do you securely operate your workload?",
+      "selected": [
+        "sec_securely_operate_reduce_management_scope",
+        "sec_securely_operate_automate_security_controls"
+      ],
+      "notes": "Evidence: All infrastructure incl. security groups, IAM roles, encryption and endpoints is CloudFormation (template.yaml, infra/*.yaml), linted with cfn-lint before every deploy (scripts/deploy.sh). Managed services reduce scope: Fargate (no hosts to patch since Phase 7), Aurora, DynamoDB, Cognito, Secrets Manager. Root user has MFA (iam get-account-summary).\nGap: Root user has an ACTIVE ACCESS KEY (AccountAccessKeysPresent=1). Single account shared with other projects (no Organizations, no workload/account separation, no SCPs). No threat model, no written control objectives."
+    },
+    "identities": {
+      "title": "How do you manage identities for people and machines?",
+      "selected": [
+        "sec_identities_secrets",
+        "sec_identities_groups_attributes"
+      ],
+      "notes": "Evidence: Machines use IAM roles only (task, execution, CodeBuild, CodePipeline, CodeDeploy roles; GitHub via CodeConnections, no tokens). DB credentials: generated 32-char password in Secrets Manager, injected via task definition valueFrom, RDS/Aurora via {{resolve:}} (Phase 9); old password reset, local password file deleted; test-user passwords kept outside the repo and deleted at teardown. Human access via IAM group admins. App users: Cognito, admin-only sign-up, 12+ char complex passwords.\nGap: Human IAM user 'sriram' has AdministratorAccess, NO MFA and a long-lived access key (since 2026-10-24) - no temporary credentials (IAM Identity Center) and no central IdP for people. No secret rotation (agreed: demo, torn down)."
+    },
+    "permissions": {
+      "title": "How do you manage permissions for people and machines?",
+      "selected": [
+        "sec_permissions_define",
+        "sec_permissions_least_privileges"
+      ],
+      "notes": "Evidence: Every role is scoped in template.yaml: execution roles pull only from their own ECR repo and the collector cache prefix, write only their own log group, read only the one secret; orders task role: dynamodb BatchWriteItem/PutItem/Query on its table only; pipeline roles: only their connection, CodeBuild projects and deployment group; iam:PassRole limited to the task roles with iam:PassedToService=ecs-tasks; trust policies with aws:SourceAccount. Roles were presented for approval before deploying (Phase 6).\nGap: Human access is full AdministratorAccess. No guardrails (no Organizations/SCPs), no IAM Access Analyzer (none in us-east-1/us-west-2), no periodic permission review or unused-access reduction, no emergency/break-glass process."
+    },
+    "detect-investigate-events": {
+      "title": "How do you detect and investigate security events?",
+      "selected": [
+        "sec_detect_investigate_events_logs"
+      ],
+      "notes": "Evidence: Application and sidecar logs go to CloudWatch Logs groups with 14-day retention; traces in aws/spans (Transaction Search); metrics + dashboard (Phase 5); Spot interruptions to an EventBridge-fed log group (Phase 8).\nGap: No CloudTrail trail in any Region (only the 90-day event history); GuardDuty, Security Hub and AWS Config are off; no ALB access logs, no VPC Flow Logs, no security alerting or correlation, no automated remediation."
+    },
+    "network-protection": {
+      "title": "How do you protect your network resources?",
+      "selected": [
+        "sec_network_protection_create_layers",
+        "sec_network_protection_layered"
+      ],
+      "notes": "Evidence: Three subnet tiers in 2 AZs: public (ALB only), private (tasks), database; private and DB subnets have no internet route at all - AWS services only via interface endpoints and free S3/DynamoDB gateway endpoints. Security groups reference each other: ALB 80 in, 3000 out only to the app SGs; app SG 3000 only from the ALB; orders SG separate; DB 5432 only from the product app SG; endpoints 443 only from task SGs; Aurora secondary SG has no ingress; blue/green test listener closed by default (TestTrafficCidr 127.0.0.1/32).\nGap: No inspection layer: no AWS WAF (Project 3 had one), no rate limiting, no Network Firewall; no automated network protection (Firewall Manager/GuardDuty)."
+    },
+    "protect-compute": {
+      "title": "How do you protect your compute resources?",
+      "selected": [
+        "sec_protect_compute_vulnerability_management",
+        "sec_protect_compute_hardened_images",
+        "sec_protect_compute_reduce_manual_management"
+      ],
+      "notes": "Evidence: ECR scan on push, findings triaged and the decision recorded (Phase 2: 5 HIGH in Debian base packages, no fixed versions available). Images: slim pinned base, multi-stage, prod deps only, pip removed, non-root uid 10001, ReadonlyRootFilesystem, exec-form CMD. No SSH/ECS Exec; Fargate since Phase 7 (EC2 hosts had IMDSv2 only and ECS_AWSVPC_BLOCK_IMDS).\nGap: Basic scanning only covers OS packages (no Inspector enhanced scanning for Python dependencies); HIGH CVEs accepted with no rebuild trigger when fixes land; no image signing (provenance attestations were disabled); no automated compute protection (GuardDuty Runtime Monitoring)."
+    },
+    "data-classification": {
+      "title": "How do you classify your data?",
+      "selected": [
+        "sec_data_classification_no"
+      ],
+      "notes": "Evidence: Data is demo product catalog rows (seeded) and synthetic test orders tied to Cognito test users; all of it was deleted at teardown.\nGap: No data classification scheme; protection controls are applied uniformly rather than by sensitivity; no lifecycle or automated classification (Macie)."
+    },
+    "protect-data-rest": {
+      "title": "How do you protect your data at rest?",
+      "selected": [
+        "sec_protect_data_rest_key_mgmt",
+        "sec_protect_data_rest_encrypt",
+        "sec_protect_data_rest_access_control"
+      ],
+      "notes": "Evidence: Encryption everywhere via AWS KMS-managed keys: Aurora StorageEncrypted (aws/rds in each Region, KmsKeyId alias/aws/rds for the secondary), DynamoDB SSE (aws/dynamodb), ECR AES256, S3 SSE + public access block + BucketOwnerEnforced, Secrets Manager (aws/secretsmanager), encrypted EBS on the former EC2 hosts. Access: DB only from the app SG, IAM scoped to single resources, TLS-only bucket policies.\nGap: No customer-managed keys (no key policies, rotation control or separation of duties); encryption is enforced only by the template, not by guardrails (Config rules/SCPs)."
+    },
+    "protect-data-transit": {
+      "title": "How do you protect your data in transit?",
+      "selected": [
+        "sec_protect_data_transit_authentication"
+      ],
+      "notes": "Evidence: App->Aurora/RDS with sslmode=require (rds.force_ssl); all AWS API calls TLS + SigV4 through VPC endpoints; S3 bucket policies deny aws:SecureTransport=false; the orders API authenticates callers with Cognito ID tokens (RS256 signature, iss/aud/token_use/exp checked, Phase 12).\nGap: The public ALB listener is HTTP :80 only: product data and the orders API's bearer tokens travel unencrypted over the internet. No ACM certificate/HTTPS listener (no domain), no HSTS, no verify-full DB certificate validation."
+    },
+    "incident-response": {
+      "title": "How do you anticipate, respond to, and recover from incidents?",
+      "selected": [
+        "sec_incident_response_no"
+      ],
+      "notes": "Evidence: Operational playbooks exist for deployments and DR (scripts/dr_drill.py, stop-deployment with rollback, scripts/teardown.sh) but not for security incidents.\nGap: No security incident response plan, contacts, forensic preparation (no CloudTrail trail or flow logs to investigate with), pre-provisioned access, playbooks or simulations."
+    },
+    "application-security": {
+      "title": "How do you incorporate and validate the security properties of applications throughout the design, development, and deployment lifecycle?",
+      "selected": [
+        "sec_appsec_deploy_software_programmatically",
+        "sec_appsec_automate_testing_throughout_lifecycle"
+      ],
+      "notes": "Evidence: All releases go through CodePipeline/CodeBuild/CodeDeploy (no manual app deploys); infrastructure via CloudFormation. pytest gates every build (34 tests incl. token tampering, wrong audience/issuer, expired and access tokens, owner-only reads, customerId from the token not the body); a broken release was stopped by the test gate (Phase 6). Staged files scanned for secrets before commits.\nGap: No code review by a second person (single maintainer, direct pushes to main), no SAST/dependency scanning (Dependabot/CodeGuru), no central package repository (CodeArtifact) - dependencies straight from PyPI (pinned), no penetration test, no periodic pipeline security review."
+    },
+    "manage-service-limits": {
+      "title": "How do you manage service quotas and constraints?",
+      "selected": [
+        "rel_manage_service_limits_aware_quotas_and_constraints",
+        "rel_manage_service_limits_aware_fixed_limits"
+      ],
+      "notes": "Evidence: Fixed limits hit and designed around, all documented: target group name 32 chars (generated names), template 51,200 bytes (S3 staging stack), 3 ENIs per t4g.small = 2 awsvpc tasks (AZ placement fixes, then Fargate), BatchWriteItem 25 items (= max order lines), workload description 250 chars, cognito-idp endpoint AZ availability.\nGap: No monitoring of quotas (Service Quotas/Trusted Advisor), no automation, no check of buffers vs. maximum scaling across both Regions."
+    },
+    "planning-network-topology": {
+      "title": "How do you plan your network topology?",
+      "selected": [
+        "rel_planning_network_topology_ha_conn_users",
+        "rel_planning_network_topology_ip_subnet_allocation",
+        "rel_planning_network_topology_non_overlap_ip"
+      ],
+      "notes": "Evidence: Public entry point: ALB across 2 AZs; interface endpoints in both AZs (except cognito-idp: not offered in use1-az1). VPC 10.50.0.0/16 with /24 subnets per tier and AZ (room for more AZs/tiers); us-west-2 VPC 10.60.0.0/16 - non-overlapping in case of peering.\nGap: Only 2 AZs; no DNS name/Route 53 failover in front of the ALB; single-AZ cognito-idp endpoint.",
+      "not_applicable_choices": {
+        "rel_planning_network_topology_ha_conn_private_networks": "No on-premises or other private networks are connected to this workload",
+        "rel_planning_network_topology_prefer_hub_and_spoke": "One VPC per Region and no inter-VPC connectivity: there is no topology to choose between hub-and-spoke and mesh"
+      }
+    },
+    "service-architecture": {
+      "title": "How do you design your workload service architecture?",
+      "selected": [
+        "rel_service_architecture_monolith_soa_microservice",
+        "rel_service_architecture_business_domains",
+        "rel_service_architecture_api_contracts"
+      ],
+      "notes": "Evidence: Two microservices by business domain: product catalog (Aurora PostgreSQL) and orders (DynamoDB), each with its own ECR repo, task definition, roles, security group, target group, scaling and pipeline. API contracts: FastAPI OpenAPI schemas and documented request/response tables in the README; status codes 200/201/400/401/404/503.\nGap: Contracts are not versioned (no /v1 prefix, no published OpenAPI document, no consumer contract tests)."
+    },
+    "prevent-interaction-failure": {
+      "title": "How do you design interactions in a distributed system to prevent failures?",
+      "selected": [
+        "rel_prevent_interaction_failure_identify",
+        "rel_prevent_interaction_failure_loosely_coupled_system"
+      ],
+      "notes": "Evidence: Dependencies identified and tested: Aurora (reader endpoint), DynamoDB (gateway endpoint), Cognito JWKS via PrivateLink (probed from both AZs), ADOT sidecar (not essential: the app keeps serving if it fails), ECR/Logs/X-Ray/Secrets Manager endpoints. The two services don't call each other; separate data stores and pipelines.\nGap: POST /orders is NOT idempotent: each retry creates a new orderId (Project 4 had an idempotency pattern). No constant-work patterns."
+    },
+    "mitigate-interaction-failure": {
+      "title": "How do you design interactions in a distributed system to mitigate or withstand failures?",
+      "selected": [
+        "rel_mitigate_interaction_failure_graceful_degradation",
+        "rel_mitigate_interaction_failure_fail_fast",
+        "rel_mitigate_interaction_failure_client_timeouts",
+        "rel_mitigate_interaction_failure_stateless"
+      ],
+      "notes": "Evidence: DB down -> fast 503 (8 ms locally) while /health stays 200, recovery without restart (Phase 1); during the Aurora switchover tasks were not replaced and recovered on their own (Phase 10). Timeouts: connect_timeout 3 s, pool wait 5 s, JWKS 5 s; keep-alive 65 s > ALB idle 60 s (fixed the ALB 502s). Tasks are stateless (state in Aurora/DynamoDB), JWKS cached.\nGap: No request throttling (no WAF/rate limits), no explicit retry/backoff configuration, no emergency levers (feature flags/load shedding)."
+    },
+    "monitor-aws-resources": {
+      "title": "How do you monitor workload resources?",
+      "selected": [
+        "rel_monitor_aws_resources_monitor_resources",
+        "rel_monitor_aws_resources_notification_aggregation",
+        "rel_monitor_aws_resources_automate_response_monitor",
+        "rel_monitor_aws_resources_storage_analytics",
+        "rel_monitor_aws_resources_end_to_end"
+      ],
+      "notes": "Evidence: Container Insights, ALB, ECS and Aurora (ACU, connections, replication + RPO lag from us-west-2) on one dashboard with FILL() metric math; scripts/check_dashboard.py verifies every metric has data. Alarms drive automated responses: unhealthy targets/5xx -> CodeDeploy rollback, CPU target tracking -> scaling. Logs Insights on aws/spans; X-Ray traces with server + SQL spans.\nGap: No notifications to people (no SNS/email/chat on alarms); monitoring scope not reviewed on a schedule."
+    },
+    "adapt-to-changes": {
+      "title": "How do you design your workload to adapt to changes in demand?",
+      "selected": [
+        "rel_adapt_to_changes_autoscale_adapt",
+        "rel_adapt_to_changes_reactive_adapt_auto",
+        "rel_adapt_to_changes_proactive_adapt_auto",
+        "rel_adapt_to_changes_load_tested_adapt"
+      ],
+      "notes": "Evidence: Target tracking on CPU 60 % (product 2-6, orders 2-4 tasks), Aurora Serverless v2 0.5-2 ACU (reached 2 ACU under write load), ECS replaces unhealthy tasks. Load tested twice: EC2 2->4->6 tasks incl. a new host (~12.5 min) and Fargate 2->4->6 in ~65 s per step, ~470-1,068 req/s (Phases 4 and 7).\nGap: No scheduled/predictive scaling; Aurora max 2 ACU is below AWS's recommendation for a busy global primary."
+    },
+    "tracking-change-management": {
+      "title": "How do you implement change?",
+      "selected": [
+        "rel_tracking_change_management_planned_changemgmt",
+        "rel_tracking_change_management_functional_testing",
+        "rel_tracking_change_management_immutable_infrastructure",
+        "rel_tracking_change_management_automated_changemgmt"
+      ],
+      "notes": "Evidence: Runbook scripts for every standard activity (deploy.sh, deploy_secondary.sh, push_image.sh, run_task.sh, dr_drill.py, teardown.sh) plus README commands. Tests gate every build; scripts/orders_e2e.py end-to-end. Immutable SHA image tags and new task sets per release (blue/green canary 10 %/5 min; rolling with circuit breaker). Pipelines + CloudFormation for all changes.\nGap: No resiliency tests inside the deployment itself (canary + alarms only); infrastructure changes are applied manually with deploy.sh, not through a pipeline."
+    },
+    "backing-up-data": {
+      "title": "How do you back up data?",
+      "selected": [
+        "rel_backing_up_data_identified_backups_data",
+        "rel_backing_up_data_secured_backups_data",
+        "rel_backing_up_data_automated_backups_data"
+      ],
+      "notes": "Evidence: Product data is reproducible (idempotent seed task); Aurora automated backups (1-day retention) are encrypted with the cluster key; the global database keeps a continuously replicated copy in us-west-2.\nGap: DynamoDB orders table without PITR or AWS Backup; 1-day retention only; no restore ever tested; replication is not a backup (deletes and corruption replicate too)."
+    },
+    "fault-isolation": {
+      "title": "How do you use fault isolation to protect your workload?",
+      "selected": [
+        "rel_fault_isolation_multiaz_region_system",
+        "rel_fault_isolation_use_bulkhead",
+        "rel_fault_isolation_single_az_system"
+      ],
+      "notes": "Evidence: Tasks, ALB and endpoints in 2 AZs (AZ spread verified after deployments, Phase 4); database in 2 Regions. Bulkheads: separate services, SGs, roles, target groups, scaling and pipelines per microservice. Single-location components recover automatically: ECS replaces tasks, Aurora replaces a failed writer instance.\nGap: Each Aurora cluster has a single instance (writer only, no reader in a second AZ): an instance failure means minutes of DB outage. Compute exists only in us-east-1. cognito-idp endpoint in one AZ."
+    },
+    "withstand-component-failures": {
+      "title": "How do you design your workload to withstand component failures?",
+      "selected": [
+        "rel_withstand_component_failures_monitoring_health",
+        "rel_withstand_component_failures_failover2good",
+        "rel_withstand_component_failures_auto_healing_system",
+        "rel_withstand_component_failures_static_stability"
+      ],
+      "notes": "Evidence: Health checks at every layer (container, ALB, collector); the ALB routes only to healthy targets; ECS replaces tasks; circuit breaker and CodeDeploy alarms roll back bad releases (rollback in 3-4 s); Spot task stop: 453/453 requests ok while the one on-demand task (FARGATE base 1) carried all traffic (Phase 8); DB switchover to us-west-2 tested.\nGap: DR switchover depends on the RDS control plane; no notifications on availability events; no availability target/SLO defined."
+    },
+    "testing-resiliency": {
+      "title": "How do you test reliability?",
+      "selected": [
+        "rel_testing_resiliency_rca_resiliency",
+        "rel_testing_resiliency_test_non_functional",
+        "rel_testing_resiliency_failure_injection_resiliency"
+      ],
+      "notes": "Evidence: Every failure got a root cause and fix in the README issues tables (keep-alive 502s, AZ placement, alarm blind spot during Install, teardown drift). Load tests (Phases 4, 7). Deliberate failure injection with measured impact: DB stop, 4 broken releases, Spot interruption, Aurora switchover.\nGap: Failure injection was manual (no AWS FIS, not repeated); no incident playbooks; the DR drill ran once, not as regular game days."
+    },
+    "planning-for-recovery": {
+      "title": "How do you plan for disaster recovery (DR)?",
+      "selected": [
+        "rel_planning_for_recovery_disaster_recovery",
+        "rel_planning_for_recovery_dr_tested",
+        "rel_planning_for_recovery_config_drift"
+      ],
+      "notes": "Evidence: Strategy: Aurora Global Database (database-only warm standby, agreed scope). Tested: managed switchover there and back in 47 s / 44 s with RPO 0; RPO lag < 1 s at ~19 writes/s (scripts/dr_drill.py, Phase 10). The secondary is defined in IaC (infra/aurora-secondary.yaml), so there is no drift.\nGap: RTO/RPO were measured, not defined as targets up front. Only the database has DR: no app, ALB or endpoints in us-west-2 and no DNS failover, so a regional outage still stops the service. Recovery is a manual script, not automated; an unplanned failover (--allow-data-loss) was not exercised."
+    },
+    "performing-architecture": {
+      "title": "How do you select the appropriate cloud resources and architecture patterns for your workload?",
+      "selected": [
+        "perf_architecture_understand_cloud_services_and_features",
+        "perf_architecture_evaluate_trade_offs",
+        "perf_architecture_guidance_architecture_patterns_best_practices",
+        "perf_architecture_factor_cost_into_architectural_decisions",
+        "perf_architecture_use_policies_and_reference_architectures",
+        "perf_architecture_use_benchmarking",
+        "perf_architecture_use_data_driven_approach"
+      ],
+      "notes": "Evidence: Decisions checked against AWS docs before building (CODE_DEPLOY constraints, Fargate Spot, PrivateLink for Cognito, global DB classes) and written down with trade-offs (README decision tables); the portfolio playbook as reference; cost per phase. Benchmarks: EC2 vs Fargate load tests, Lambda (Project 3) vs ECS latency. Data-driven changes: canary after measuring a 100 % blast radius, keep-alive after ALB 502 metrics, AZ settings after placement checks.\nGap: None significant for this scope."
+    },
+    "compute-hardware": {
+      "title": "How do you select and use compute resources in your workload?",
+      "selected": [
+        "perf_compute_hardware_select_best_compute_options",
+        "perf_compute_hardware_collect_compute_related_metrics",
+        "perf_compute_hardware_scale_compute_resources_dynamically",
+        "perf_compute_hardware_understand_compute_configuration_features",
+        "perf_compute_hardware_configure_and_right_size_compute_resources"
+      ],
+      "notes": "Evidence: Fargate ARM64 chosen on measured data (2 tasks: ~470 req/s at p50 ~125 ms vs ~260 req/s on EC2); Container Insights CPU/memory per service and cluster; target tracking; configuration understood and documented (ENI limits, task-level CPU/memory, platform version, Spot). 0.25 vCPU/0.5 GB is the smallest Fargate size; CPU saturates at ~96 % under load and scaling adds tasks.\nGap: Memory use ~10-15 % of 512 MB (already the smallest size for 0.25 vCPU); the ~1.8x Fargate vs EC2 difference is measured but not explained.",
+      "not_applicable_choices": {
+        "perf_compute_hardware_compute_accelerators": "A JSON CRUD API has no workload for GPUs or other accelerators"
+      }
+    },
+    "data-management": {
+      "title": "How do you store, manage, and access data in your workload?",
+      "selected": [
+        "perf_data_use_purpose_built_data_store",
+        "perf_data_collect_record_data_store_performance_metrics",
+        "perf_data_evaluate_configuration_options_data_store",
+        "perf_data_implement_strategies_to_improve_query_performance"
+      ],
+      "notes": "Evidence: Relational catalog in Aurora PostgreSQL, key-value orders in DynamoDB on-demand (key = orderId + itemId, single-partition Query). Metrics: SQL span p50 1.4 ms, Aurora ACU/connections, replication lag. Options evaluated: RDS vs Aurora, Serverless v2 vs provisioned vs I/O-Optimized (cost estimate), reader endpoint for the read-only app; connection pooling (psycopg_pool).\nGap: No caching layer (no ElastiCache/DAX - product data would cache well); no read replicas to offload reads."
+    },
+    "networking": {
+      "title": "How do you select and configure networking resources in your workload?",
+      "selected": [
+        "perf_networking_understand_how_networking_impacts_performance",
+        "perf_networking_evaluate_networking_features",
+        "perf_networking_load_balancing_distribute_traffic",
+        "perf_networking_optimize_network_configuration_based_on_metrics"
+      ],
+      "notes": "Evidence: Latency broken down: in-app 4.7 ms vs ~35-60 ms seen from the laptop (network). Gateway vs interface endpoints, PrivateLink and cross-AZ endpoint access evaluated; ALB with ip targets across 2 AZs and path routing; keep-alive and deregistration delay tuned from metrics (502s, Spot drain).\nGap: No CloudFront/edge, HTTP/1.1 only (no HTTP/2 or TLS on the ALB), Region chosen by default rather than by user location.",
+      "not_applicable_choices": {
+        "perf_networking_choose_appropriate_dedicated_connectivity_or_vpn": "No on-premises connectivity exists or is needed"
+      }
+    },
+    "process-culture": {
+      "title": "What process do you use to support more performance efficiency for your workload?",
+      "selected": [
+        "perf_process_culture_use_monitoring_solutions",
+        "perf_process_culture_workload_performance",
+        "perf_process_culture_load_test",
+        "perf_process_culture_automation_remediate_issues"
+      ],
+      "notes": "Evidence: Dashboard, traces and load-test CSVs; every phase measured and documented with numbers; load tests in Phases 4 and 7; automated remediation through scaling and rollbacks.\nGap: No KPIs/SLOs (latency, error-rate targets), no regular metric reviews, no automated dependency or image updates."
+    },
+    "cloud-financial-management": {
+      "title": "How do you implement cloud financial management?",
+      "selected": [
+        "cost_cloud_financial_management_function",
+        "cost_cloud_financial_management_budget_forecast",
+        "cost_cloud_financial_management_cost_awareness",
+        "cost_cloud_financial_management_proactive_process",
+        "cost_cloud_financial_management_quantify_value"
+      ],
+      "notes": "Evidence: One owner for cost decisions; account budgets exist ($100/$50/$90 monthly); every hourly-billed resource was priced and approved before deployment (Aurora options, endpoints, Spot); cost toggles; docs/cost-estimate.md with Price List API prices; savings quantified (Fargate -$0.09/h, Spot 35-46 %, alternatives -$36 to -$44/month).\nGap: No cost reporting/notification specific to this workload; the 'project' cost allocation tag is inactive, so actual cost per project can't be reported."
+    },
+    "govern-usage": {
+      "title": "How do you govern usage?",
+      "selected": [
+        "cost_govern_usage_policies",
+        "cost_govern_usage_track_lifecycle"
+      ],
+      "notes": "Evidence: The playbook's cost hygiene policy (toggles, demo then off, teardown at the end) was applied; the project was tracked from plan to decommissioning (README progress, Phase 13).\nGap: Single shared account (no account structure per workload/environment), no numeric cost targets, no enforcing controls (SCPs, budget actions), no role separation."
+    },
+    "monitor-usage": {
+      "title": "How do you monitor your cost and usage?",
+      "selected": [
+        "cost_monitor_usage_define_attribution",
+        "cost_monitor_usage_config_tools"
+      ],
+      "notes": "Evidence: Attribution category defined and applied: tag project=containerized-microservices on all resources (deploy.sh --tags + resource tags); budgets configured in the account.\nGap: The tag is NOT activated as a cost allocation tag (ce list-cost-allocation-tags: Inactive) and the account also hosts other workloads; no CUR/Cost Explorer views; no KPI such as cost per 1,000 requests tracked."
+    },
+    "decomissioning-resources": {
+      "title": "How do you decommission resources?",
+      "selected": [
+        "cost_decomissioning_resources_track",
+        "cost_decomissioning_resources_implement_process",
+        "cost_decomissioning_resources_decommission",
+        "cost_decomissioning_resources_data_retention",
+        "cost_decomissioning_resources_decomm_automated"
+      ],
+      "notes": "Evidence: scripts/teardown.sh decommissions both Regions in dependency order, incl. resources created outside CloudFormation, then verifies with service describe calls (the tagging API lags). Retention: logs 14 days, S3 lifecycle 7/14 days, ECR keeps 10 images. Executed 2026-11-01: nothing billable left.\nGap: None for this scope."
+    },
+    "select-service": {
+      "title": "How do you evaluate cost when you select services?",
+      "selected": [
+        "cost_select_service_analyze_all",
+        "cost_select_service_thorough_analysis",
+        "cost_select_service_select_for_cost",
+        "cost_select_service_analyze_over_time",
+        "cost_select_service_licensing"
+      ],
+      "notes": "Evidence: docs/cost-estimate.md analyzes every component (fixed, scenario A 10 M requests, B 100 M requests) and alternatives (NAT vs endpoints, headless secondary, 1-AZ endpoints, Container Insights off). Cost-driven choices: Fargate ARM + Spot, Serverless v2, free gateway endpoints, Cognito Lite, on-demand DynamoDB; phase-by-phase cost history; open-source stack (no licenses).\nGap: No written organizational cost requirements."
+    },
+    "type-size-number-resources": {
+      "title": "How do you meet cost targets when you select resource type, size and number?",
+      "selected": [
+        "cost_type_size_number_resources_cost_modeling",
+        "cost_type_size_number_resources_data",
+        "cost_type_size_number_resources_shared",
+        "cost_type_size_number_resources_metrics"
+      ],
+      "notes": "Evidence: Cost model in docs/cost-estimate.md; sizes from load tests (2 tasks handle ~470 req/s); shared ALB and endpoints for both services; automatic sizing by metrics (target tracking, Serverless v2 ACU).\nGap: None significant; the Aurora minimum ACU and the endpoint count are fixed costs that don't scale down."
+    },
+    "pricing-model": {
+      "title": "How do you use pricing models to reduce cost?",
+      "selected": [
+        "cost_pricing_model_analysis",
+        "cost_pricing_model_region_cost",
+        "cost_pricing_model_implement_models"
+      ],
+      "notes": "Evidence: On-demand vs Fargate Spot analyzed and implemented (FARGATE base 1 + SPOT weight 3); Serverless v2 vs provisioned Aurora compared; us-east-1 and us-west-2 prices checked identical (Price List API).\nGap: No Savings Plans/reservations (short-lived demo); the actual Spot discount was not yet verified from billing data.",
+      "not_applicable_choices": {
+        "cost_pricing_model_third_party": "No third-party software or agreements are part of this workload"
+      }
+    },
+    "data-transfer": {
+      "title": "How do you plan for data transfer charges?",
+      "selected": [
+        "cost_data_transfer_modeling",
+        "cost_data_transfer_optimized_components",
+        "cost_data_transfer_implement_services"
+      ],
+      "notes": "Evidence: Modeled: endpoint data processing, cross-Region replication, ALB LCU (cost estimate). Components chosen to avoid transfer cost: S3 and DynamoDB gateway endpoints (free), ECR pull-through cache in-Region, no NAT gateway.\nGap: Inter-Region replication volume not measured from billing data."
+    },
+    "manage-demand-resources": {
+      "title": "How do you manage demand, and supply resources?",
+      "selected": [
+        "cost_manage_demand_resources_cost_analysis",
+        "cost_manage_demand_resources_dynamic"
+      ],
+      "notes": "Evidence: Demand analyzed with load tests and scenarios; resources supplied dynamically: target tracking, Serverless v2, Fargate (no idle hosts), DynamoDB on-demand.\nGap: No buffering or throttling of demand (no queue, no rate limits)."
+    },
+    "evaluate-new-services": {
+      "title": "How do you evaluate new services?",
+      "selected": [
+        "cost_evaluate_new_services_review_process"
+      ],
+      "notes": "Evidence: Review process: this Well-Architected review plus the portfolio playbook's lessons table applied at each project start; new features evaluated during the build (ECS AZ rebalancing, CodePipeline V2 triggers, Cognito PrivateLink).\nGap: No regular re-review of the running workload (it was decommissioned)."
+    },
+    "evaluate-cost-effort": {
+      "title": "How do you evaluate the cost of effort?",
+      "selected": [
+        "cost_evaluate_cost_effort_automations_operations"
+      ],
+      "notes": "Evidence: Operations automated: two pipelines, deploy/teardown/DR/test scripts, dashboard checker.\nGap: None for this scope."
+    }
+  }
+}

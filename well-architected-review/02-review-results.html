@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Well-Architected review results — aws-containerized-microservices</title>
+<style>
+body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+       line-height: 1.6; color: #1f2328; max-width: 980px; margin: 0 auto; padding: 2rem 1.5rem; }
+h1, h2, h3 { line-height: 1.25; }
+h1 { border-bottom: 2px solid #ff9900; padding-bottom: .3em; }
+h2 { border-bottom: 1px solid #d0d7de; padding-bottom: .3em; margin-top: 2em; }
+a { color: #0969da; text-decoration: none; } a:hover { text-decoration: underline; }
+code { background: #f3f4f6; padding: .1em .35em; border-radius: 4px; font-size: 90%; }
+pre { background: #161b22; color: #e6edf3; padding: 1em; border-radius: 6px; overflow-x: auto; }
+pre code { background: none; padding: 0; color: inherit; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; display: block; overflow-x: auto; }
+th, td { border: 1px solid #d0d7de; padding: .45em .7em; vertical-align: top; text-align: left; }
+th { background: #f6f8fa; }
+tr:nth-child(even) td { background: #fafbfc; }
+blockquote { margin: 1em 0; padding: .5em 1em; border-left: 4px solid #ff9900; background: #fff8ec; }
+blockquote p { margin: .3em 0; }
+img { max-width: 100%; border: 1px solid #d0d7de; border-radius: 4px; }
+footer { margin-top: 3em; font-size: 85%; color: #656d76; border-top: 1px solid #d0d7de; padding-top: 1em; }
+</style>
+</head>
+<body>
+<h1 id="well-architected-review-results-aws-containerized-microservices">Well-Architected review results — aws-containerized-microservices</h1>
+<p>Review of the architecture <strong>as built</strong> at the end of Phase 12 (repository <code>main</code> @ <code>8aae8bd</code>),
+answered in the <strong>AWS Well-Architected Tool</strong> with the <strong>Well-Architected Framework</strong> lens and the
+<strong>Container Build Lens</strong>, milestone <strong><code>v1.0-baseline</code></strong> (2026-11-01).</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Scope</strong></td>
+<td>Pillars <strong>Security, Reliability (incl. disaster recovery), Performance Efficiency, Cost Optimization</strong>. Operational Excellence and Sustainability were not reviewed (by request) and are left unanswered in the tool</td>
+</tr>
+<tr>
+<td><strong>Workload</strong></td>
+<td>ECS Fargate (+ Spot, ARM64) microservices behind an ALB in private subnets with VPC endpoints; Aurora PostgreSQL Global Database (us-east-1 + us-west-2); DynamoDB; Cognito; Secrets Manager; CodePipeline/CodeBuild/CodeDeploy blue/green; CloudFormation</td>
+</tr>
+<tr>
+<td><strong>State</strong></td>
+<td>Decommissioned after the build (Phase 13). The review uses the template, scripts, tests, README measurements and the cost estimate as evidence; nothing had to run</td>
+</tr>
+<tr>
+<td><strong>Method</strong></td>
+<td>Same as Project 3 (<a href="https://github.com/sriram-um/aws-serverless-application/blob/main/well-architected-review/01-how-to-do-a-review.md">how to do a review</a>): answers as code in <a href="https://github.com/sriram-um/aws-containerized-microservices/blob/main/well-architected-review/answers/"><code>answers/</code></a>, a best practice is ticked <strong>only with evidence</strong> (file, setting or measurement), every note has <em>Evidence</em> and <em>Gap</em>; plus read-only account checks</td>
+</tr>
+</tbody>
+</table>
+<h2 id="results">Results</h2>
+<p><img alt="Questions by risk per pillar: Framework lens and Container Build Lens" src="images/baseline-risks.png" /></p>
+<table>
+<thead>
+<tr>
+<th>Lens</th>
+<th>Questions</th>
+<th>🔴 High</th>
+<th>🟠 Medium</th>
+<th>🟢 None</th>
+<th>⚪ N/A</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Framework — Security</td>
+<td>11</td>
+<td><strong>7</strong></td>
+<td>4</td>
+<td>0</td>
+<td></td>
+</tr>
+<tr>
+<td>Framework — Reliability</td>
+<td>13</td>
+<td><strong>5</strong></td>
+<td>4</td>
+<td>4</td>
+<td></td>
+</tr>
+<tr>
+<td>Framework — Performance</td>
+<td>5</td>
+<td><strong>1</strong></td>
+<td>2</td>
+<td>2</td>
+<td></td>
+</tr>
+<tr>
+<td>Framework — Cost</td>
+<td>11</td>
+<td><strong>4</strong></td>
+<td>2</td>
+<td>5</td>
+<td></td>
+</tr>
+<tr>
+<td><strong>Framework total</strong></td>
+<td><strong>40</strong></td>
+<td><strong>17</strong></td>
+<td><strong>12</strong></td>
+<td><strong>11</strong></td>
+<td></td>
+</tr>
+<tr>
+<td>Container Build Lens (same 4 pillars)</td>
+<td>23</td>
+<td><strong>1</strong></td>
+<td>6</td>
+<td>15</td>
+<td>1</td>
+</tr>
+</tbody>
+</table>
+<p>120 Framework and 30 Container Build best practices are in place. The per-question table is in
+the <a href="#appendix-every-question">appendix</a>.</p>
+<p><strong>Reading the numbers:</strong> the workload itself scores well where it was engineered and measured
+(container build, compute, scaling, data stores, decommissioning). Most high risks come from two
+places that the project never addressed: <strong>the AWS account</strong> (identity, logging, detection,
+governance) and <strong>things a production service needs beyond a demo</strong> (HTTPS, notifications,
+defined recovery objectives, incident response).</p>
+<h2 id="what-was-done-well">What was done well</h2>
+<table>
+<thead>
+<tr>
+<th>Pillar</th>
+<th>Strengths (evidence)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Security</td>
+<td>No internet route from private subnets, only VPC endpoints; security groups chained by reference (ALB → app → DB); every IAM role scoped to single resources with <code>iam:PassRole</code> conditions; DB password generated in Secrets Manager and injected via <code>valueFrom</code>; encryption at rest everywhere; hardened images (slim, non-root, read-only root filesystem); token verification tested against tampering, wrong audience/issuer, expiry and token type</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>Two AZs, AZ spread verified after deployments; health checks at every layer with <code>/health</code> independent of the DB; blue/green canary with alarm rollback (bad release reached 10.1 % instead of 100 %) and rolling deployments with circuit breaker; Spot interruption handled with an on-demand base task; graceful degradation (fast 503s, automatic recovery)</td>
+</tr>
+<tr>
+<td>Disaster recovery</td>
+<td>Aurora Global Database in a second Region, defined in IaC; managed switchover there and back <strong>tested and measured</strong> (47 s / 44 s, RPO 0; RPO lag &lt; 1 s under writes); a scripted, re-runnable teardown</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>Choices driven by benchmarks: EC2 vs Fargate load tests (~260 vs ~470 req/s for 2 tasks), Lambda vs ECS latency; scaling measured step by step; keep-alive and drain settings tuned from metrics; purpose-built data stores</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>Every hourly-billed resource priced before deployment and switched off between demos; Fargate ARM + Spot; free gateway endpoints; a cost estimate with Price List API prices and scenarios; complete decommissioning</td>
+</tr>
+<tr>
+<td>Container build</td>
+<td>Multi-stage, prod-only dependencies, immutable SHA tags, ECR lifecycle policies, native ARM builds with layer cache, scan on push, signal handling, health checks, CPU/memory limits</td>
+</tr>
+</tbody>
+</table>
+<h2 id="high-risk-issues-grouped-by-theme">High-risk issues, grouped by theme</h2>
+<h3 id="1-account-security-baseline-security-securely-operate-identities-detect-incident-response-container-sec2">1. Account security baseline (Security: securely operate, identities, detect, incident response; Container SEC2)</h3>
+<p>Found by the read-only account checks, not in the repository:</p>
+<table>
+<thead>
+<tr>
+<th>Finding</th>
+<th>Evidence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Root user has an active access key</strong></td>
+<td><code>iam get-account-summary</code>: <code>AccountAccessKeysPresent: 1</code> (root MFA is on)</td>
+</tr>
+<tr>
+<td>The only IAM user has <strong>AdministratorAccess, no MFA</strong>, and a long-lived access key</td>
+<td><code>list-mfa-devices</code>: 0; access key created 2026-10-24</td>
+</tr>
+<tr>
+<td><strong>No CloudTrail trail</strong> in either Region</td>
+<td><code>describe-trails</code>: empty (only the 90-day event history)</td>
+</tr>
+<tr>
+<td><strong>GuardDuty, Security Hub, AWS Config, IAM Access Analyzer: off</strong></td>
+<td>No detectors, recorders or analyzers in us-east-1 or us-west-2</td>
+</tr>
+<tr>
+<td>Single account shared with other workloads; no AWS Organizations</td>
+<td><code>AWSOrganizationsNotInUseException</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="2-data-in-transit-security-protect-data-in-transit">2. Data in transit (Security: protect data in transit)</h3>
+<p>The public listener is <strong>HTTP :80 only</strong>, so product data and the orders API's <strong>bearer tokens</strong>
+cross the internet unencrypted. There's no domain, so no ACM certificate or HTTPS listener exists.
+Inside AWS everything is TLS: Aurora with <code>sslmode=require</code>, AWS APIs via endpoints, TLS-only
+bucket policies.</p>
+<h3 id="3-application-security-process-security-application-security-data-classification">3. Application security process (Security: application security, data classification)</h3>
+<p>No second-person code review (direct pushes to <code>main</code>), no dependency or SAST scanning, no central
+package repository, no penetration test. Basic ECR scanning covers OS packages only. There is no
+data classification scheme (the data was demo data, but that was never written down).</p>
+<h3 id="4-resilience-mechanisms-reliability-mitigate-interaction-failure-monitor-quotas-testing">4. Resilience mechanisms (Reliability: mitigate interaction failure, monitor, quotas, testing)</h3>
+<ul>
+<li><strong>No request throttling</strong>: no WAF or rate limits in front of the ALB; Project 3 had them.</li>
+<li><strong>No notifications to people</strong>: alarms only trigger rollbacks and scaling; nobody is paged.</li>
+<li><strong>Quotas aren't monitored</strong>: limits were hit and designed around, but none are watched.</li>
+<li><strong>Failure testing was manual and one-off</strong>: deliberate failures were well measured, but there
+  is no AWS FIS experiment, recurring game day or incident playbook.</li>
+<li><em>Also noted (medium):</em> <code>POST /orders</code> isn't idempotent; the DynamoDB table has no PITR; each
+  Aurora cluster has a single instance.</li>
+</ul>
+<h3 id="5-disaster-recovery-reliability-plan-for-dr">5. Disaster recovery (Reliability: plan for DR)</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>In place</td>
+<td>Aurora Global Database, secondary stack in IaC (no drift), managed switchover tested both ways with measured RTO (~45 s) and RPO (0; RPO lag &lt; 1 s)</td>
+</tr>
+<tr>
+<td>Why it's still high risk</td>
+<td><strong>Recovery objectives were measured, not defined</strong> as targets up front. <strong>Only the database has DR</strong>: no app, ALB or endpoints in us-west-2 and no DNS failover, so a regional outage stops the service even though the data survives. Recovery is a manual script; an <em>unplanned</em> failover (<code>--allow-data-loss</code>) was never exercised</td>
+</tr>
+</tbody>
+</table>
+<p>This was the agreed scope ("database-only DR"). The review makes the consequence explicit: the
+database's RTO is about a minute, but the <strong>application's</strong> RTO for a regional outage is undefined.</p>
+<h3 id="6-cost-governance-cost-financial-management-govern-usage-monitor-usage-select-service">6. Cost governance (Cost: financial management, govern usage, monitor usage, select service)</h3>
+<p>The engineering side of cost is strong; the <strong>governance</strong> side is missing. The <code>project</code> tag is
+on every resource but <strong>not activated</strong> as a cost allocation tag, so actual cost per project can't
+be reported. There are no written cost requirements or targets, no account per workload, no
+enforcing controls (budget actions, SCPs), and no cost KPI such as cost per 1,000 requests.</p>
+<h3 id="7-performance-process-performance-process-and-culture">7. Performance process (Performance: process and culture)</h3>
+<p>The workload was measured thoroughly, but there are <strong>no KPIs/SLOs</strong> (latency, error-rate targets),
+no regular metric reviews, and no automated dependency or base-image updates.</p>
+<h2 id="improvement-plan">Improvement plan</h2>
+<p>Ordered by risk reduced per effort. Costs are us-east-1 list prices.</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Change</th>
+<th>Effort</th>
+<th>Running cost</th>
+<th>Addresses</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><strong>Delete the root access key</strong>; MFA for user <code>sriram</code>, then move people to IAM Identity Center (temporary credentials)</td>
+<td>S</td>
+<td>$0</td>
+<td>securely-operate, identities, permissions, Container SEC2</td>
+</tr>
+<tr>
+<td>2</td>
+<td><strong>Multi-Region CloudTrail trail</strong> (log file validation, S3 + lifecycle)</td>
+<td>S</td>
+<td>first management-event trail free + S3 cents</td>
+<td>detect-investigate, incident-response</td>
+</tr>
+<tr>
+<td>3</td>
+<td><strong>GuardDuty + IAM Access Analyzer</strong> (external access) in both Regions; Security Hub foundational checks</td>
+<td>S</td>
+<td>GuardDuty usage-based (small for this account, 30-day trial); Access Analyzer free; Security Hub per check</td>
+<td>detect-investigate, permissions, protect-compute</td>
+</tr>
+<tr>
+<td>4</td>
+<td><strong>HTTPS</strong>: domain + ACM certificate, :443 listener, redirect :80</td>
+<td>S</td>
+<td>Route 53 zone $0.50/month + domain; ACM free</td>
+<td>protect-data-transit</td>
+</tr>
+<tr>
+<td>5</td>
+<td><strong>Notifications</strong>: SNS topic for the existing alarms, budget alerts by tag</td>
+<td>S</td>
+<td>≈ $0</td>
+<td>monitor-aws-resources, withstand-component-failures</td>
+</tr>
+<tr>
+<td>6</td>
+<td><strong>Activate the <code>project</code> cost allocation tag</strong>; budget per project; cost KPI on the dashboard</td>
+<td>S</td>
+<td>$0</td>
+<td>monitor-usage, cloud-financial-management</td>
+</tr>
+<tr>
+<td>7</td>
+<td><strong>AWS WAF</strong> on the ALB with a rate-based rule and AWS managed rules</td>
+<td>S</td>
+<td>$5 + $1/rule per month + $0.60/M requests</td>
+<td>mitigate-interaction-failure, network-protection</td>
+</tr>
+<tr>
+<td>8</td>
+<td><strong>Define targets</strong>: RTO/RPO, SLOs (p95 latency, availability) and cost targets in the README; alarms on them</td>
+<td>S</td>
+<td>$0.10/alarm</td>
+<td>planning-for-recovery, process-culture, select-service, govern-usage</td>
+</tr>
+<tr>
+<td>9</td>
+<td>Branch protection + PR review; Dependabot; ECR <strong>enhanced scanning</strong> (Inspector)</td>
+<td>M</td>
+<td>Inspector per image scan</td>
+<td>application-security, Container SEC3/PERF4</td>
+</tr>
+<tr>
+<td>10</td>
+<td><strong>Pilot-light app in us-west-2</strong>: same template with a Region condition, ECR replication, Route 53 failover; FIS experiment + yearly game day</td>
+<td>L</td>
+<td>ECR replication cents; endpoints/ALB only during a failover or drill</td>
+<td>planning-for-recovery, testing-resiliency, fault-isolation</td>
+</tr>
+<tr>
+<td>11</td>
+<td>Idempotency key for <code>POST /orders</code>; DynamoDB PITR; Aurora 7-day backups + a restore test</td>
+<td>M</td>
+<td>PITR $0.20/GB-month</td>
+<td>prevent-interaction-failure, backing-up-data</td>
+</tr>
+<tr>
+<td>12</td>
+<td>Service Quotas alarms (Fargate vCPU, ENIs, ALB targets)</td>
+<td>S</td>
+<td>$0.10/alarm</td>
+<td>manage-service-limits</td>
+</tr>
+<tr>
+<td>13</td>
+<td>Data classification note + security incident playbook</td>
+<td>S</td>
+<td>$0</td>
+<td>data-classification, incident-response</td>
+</tr>
+</tbody>
+</table>
+<p>Steps 1-6 are small, cost almost nothing, and address <strong>9 of the 17</strong> Framework high risks
+(fully or in part); with steps 7, 8 and 13 it's 14 of 17. The other three (application security, resilience testing, quotas) need steps 9, 10 and 12.</p>
+<h2 id="accepted-risks">Accepted risks</h2>
+<table>
+<thead>
+<tr>
+<th>Risk</th>
+<th>Why accepted</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>No secret rotation</td>
+<td>Agreed for this demo (torn down after the build); documented how rotation would work (Phase 9)</td>
+</tr>
+<tr>
+<td>Single Aurora instance per Region, 0.5-2 ACU</td>
+<td>Demo sizing to keep cost at ≈ $0.12/h; AWS recommends ≥ 8 ACU and a reader for a busy global primary</td>
+</tr>
+<tr>
+<td>HIGH CVEs in Debian base packages</td>
+<td>No fixed versions available at build time (checked with <code>apt list --upgradable</code>)</td>
+</tr>
+<tr>
+<td>Database-only DR</td>
+<td>Agreed scope; the gap to full-application DR is documented above</td>
+</tr>
+<tr>
+<td>Operational Excellence and Sustainability not reviewed</td>
+<td>Out of scope for this review (by request)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="lessons-from-the-review">Lessons from the review</h2>
+<ul>
+<li><strong>The account was the weakest part again.</strong> As in Project 3, the most serious findings
+  (root access key, no MFA, no CloudTrail, no GuardDuty) came from read-only account checks, not
+  from the repository. They are cheap to fix and affect every project in the account.</li>
+<li><strong>Measured isn't the same as defined.</strong> The DR drill produced good numbers (RTO ~45 s, RPO 0),
+  but without targets agreed up front the tool can't, and shouldn't, rate them as meeting
+  objectives.</li>
+<li><strong>"None of these" vs. unanswered:</strong> a question with nothing in place has to be answered
+  explicitly with "None of these"; leaving it empty silently drops it from the risk counts.</li>
+<li><strong>Tool quirks:</strong> the Container Build Lens has no lens alias (only an ARN, which can't be used
+  as a file name), and the workload description is limited to 250 characters.</li>
+</ul>
+<h2 id="reports">Reports</h2>
+<p><code>reports/baseline-wellarchitected.pdf</code> and <code>reports/baseline-containerbuild.pdf</code> are the official
+reports from the tool. They are <strong>not committed</strong> (git-ignored) because they include account
+findings. <code>reports/baseline-risks.json</code> holds the per-question risks behind the chart and table.</p>
+<h2 id="appendix-every-question">Appendix: every question</h2>
+<p><strong>Framework</strong></p>
+<table>
+<thead>
+<tr>
+<th>Pillar</th>
+<th>Question</th>
+<th>Risk</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Security</td>
+<td>How do you securely operate your workload?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Security</td>
+<td>How do you manage identities for people and machines?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Security</td>
+<td>How do you manage permissions for people and machines?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Security</td>
+<td>How do you detect and investigate security events?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Security</td>
+<td>How do you protect your network resources?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Security</td>
+<td>How do you protect your compute resources?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Security</td>
+<td>How do you classify your data?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Security</td>
+<td>How do you protect your data at rest?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Security</td>
+<td>How do you protect your data in transit?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Security</td>
+<td>How do you anticipate, respond to, and recover from incidents?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Security</td>
+<td>How do you incorporate and validate the security properties of applications throughout the design, development, and deployment lifecycle?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you manage service quotas and constraints?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you plan your network topology?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you design your workload service architecture?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you design interactions in a distributed system to prevent failures?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you design interactions in a distributed system to mitigate or withstand failures?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you monitor workload resources?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you design your workload to adapt to changes in demand?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you implement change?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you back up data?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you use fault isolation to protect your workload?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you design your workload to withstand component failures?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you test reliability?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you plan for disaster recovery (DR)?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>How do you select the appropriate cloud resources and architecture patterns for your workload?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>How do you select and use compute resources in your workload?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>How do you store, manage, and access data in your workload?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>How do you select and configure networking resources in your workload?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>What process do you use to support more performance efficiency for your workload?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you implement cloud financial management?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you govern usage?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you monitor your cost and usage?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you decommission resources?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you evaluate cost when you select services?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you meet cost targets when you select resource type, size and number?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you use pricing models to reduce cost?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you plan for data transfer charges?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you manage demand, and supply resources?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you evaluate new services?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you evaluate the cost of effort?</td>
+<td>🟢 None</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Container Build Lens</strong></p>
+<table>
+<thead>
+<tr>
+<th>Pillar</th>
+<th>Question</th>
+<th>Risk</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Security</td>
+<td>How do you ensure that your container images are using least privilege identity?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Security</td>
+<td>How do you control access to your build infrastructure?</td>
+<td>🔴 High</td>
+</tr>
+<tr>
+<td>Security</td>
+<td>How do you detect and address vulnerabilities within your container image?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Security</td>
+<td>How do you manage your container image boundaries?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Security</td>
+<td>How do you handle data within your containerized applications?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you limit the amount of CPU and memory a container consumes?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you handle persistent data in a container application?</td>
+<td>⚪ N/A</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you automate building and testing of containers?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do I cascade updates to a parent or base image?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Reliability</td>
+<td>How do you monitor the health of a container?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>How do you reduce the size of your container image?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>How do you reduce the pull time of your container image?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>How do you make sure to get consistent results for your target images?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>How do you make sure to use updated versions for parent images?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>How do you make sure you get consistent performance results over time?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>How do you optimize the size of your target image?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you design your container build process to avoid unnecessary cost?</td>
+<td>🟠 Medium</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>Ensure that your container images contain only what is relevant for your application to run</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you reduce your container images size?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you design your containerized application to support automatic scaling and graceful termination?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you design your containerized application to support multiple CPU architectures?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>How do you minimize cost for your containerized application during startup time?</td>
+<td>🟢 None</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>What systems are you using to create your container build process?</td>
+<td>🟢 None</td>
+</tr>
+</tbody>
+</table>
+<footer>Generated from <a href="https://github.com/sriram-um/aws-containerized-microservices/blob/main/well-architected-review/02-review-results.md">02-review-results.md</a> · <a href="https://github.com/sriram-um/aws-containerized-microservices">sriram-um/aws-containerized-microservices</a></footer>
+</body>
+</html>

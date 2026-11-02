@@ -13,7 +13,7 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 | **Runtime** | Python 3.12, FastAPI + uvicorn, psycopg 3; container on port 3000, arm64 (Graviton) |
 | **Regions** | us-east-1 (primary), us-west-2 (Aurora Global Database secondary) |
 | **CI/CD** | AWS CodePipeline (GitHub via CodeConnections) → CodeBuild → CodeDeploy ECS blue/green |
-| **Status** | **Decommissioned** on 2026-11-01 (all resources deleted in both Regions, see [Phase 13](#phase-13--teardown-and-decommissioning-2026-11-01)) |
+| **Status** | **Complete; decommissioned** on 2026-11-01 (all resources deleted in both Regions, see [Phase 13](#phase-13--teardown-and-decommissioning-2026-11-01)); [Well-Architected review](well-architected-review/) done |
 
 ## Progress
 
@@ -32,7 +32,7 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 | 10 | Disaster recovery | Aurora Global Database | ✅ Done |
 | 11 | Cost estimate | AWS Pricing Calculator | ✅ Done ([docs/cost-estimate.md](docs/cost-estimate.md)) |
 | 12 | Real-world project | Orders service (Project 3) on ECS | ✅ Done |
-| 13 | Close-out | Teardown ✅ (Well-Architected review: not done yet, see Phase 13) | 🟡 |
+| 13 | Close-out | Well-Architected review ([results](well-architected-review/02-review-results.md)), teardown | ✅ Done |
 
 ## Process
 
@@ -1175,11 +1175,33 @@ Everything was deleted at the end of the project with [`scripts/teardown.sh`](sc
 | AWS Connector for GitHub installation on `sriram-um` | GitHub-side; harmless without a connection | none; uninstall in GitHub → Settings → Applications if not needed |
 | Cost-allocation tag `project` | Inactive; activating it is an account-level billing choice | none |
 
-**Not done:** the Well-Architected review (playbook §10) and the teardown → rebuild → teardown
-proof. The review needs no running resources (template, README measurements and cost estimate are
-the evidence) and can be done later at no cost. A rebuild would need, in this order: bootstrap
-bucket, main stack with `EnableCompute=false EnableDatabase=false`, `push_image.sh` for both
-services, then both toggles on, the secondary stack, the seed task and one run of each pipeline.
+**Not done:** the teardown → rebuild → teardown proof. A rebuild would need, in this order:
+bootstrap bucket, main stack with `EnableCompute=false EnableDatabase=false`, `push_image.sh` for
+both services, then both toggles on, the secondary stack, the seed task and one run of each
+pipeline.
+
+#### Well-Architected review
+
+Reviewed after the teardown, from the repository and the measurements (nothing has to run), in the
+AWS Well-Architected Tool: **Framework** lens + **Container Build Lens**, pillars **Security,
+Reliability (incl. DR), Performance, Cost**; milestone `v1.0-baseline`. Full results, improvement
+plan and every answer with its evidence: **[well-architected-review/](well-architected-review/)**.
+
+![Well-Architected review: questions by risk per pillar](well-architected-review/images/baseline-risks.png)
+
+| | High | Medium | No risk |
+|---|---|---|---|
+| Framework (40 questions) | 17 | 12 | 11 |
+| Container Build Lens (23 questions, 1 N/A) | 1 | 6 | 15 |
+
+- **Strong:** network isolation, scoped IAM, secrets handling, encryption at rest, hardened images,
+  multi-AZ + blue/green/canary with alarm rollback, measured DR switchover (~45 s, RPO 0),
+  benchmark-driven compute choices, cost estimate and complete decommissioning.
+- **High risks, mostly outside the template:** root access key, no MFA, no CloudTrail/GuardDuty
+  (account), HTTP-only listener, no alarm notifications or throttling, recovery objectives not
+  defined and no application DR in us-west-2, cost allocation tag inactive.
+- **Cheapest wins:** delete the root key + MFA, a CloudTrail trail, GuardDuty/Access Analyzer,
+  HTTPS, SNS notifications, activating the cost tag. Together they address 9 of the 17 high risks.
 
 ## Repository layout
 
@@ -1191,7 +1213,8 @@ infra/aurora-secondary.yaml      us-west-2 stack: Aurora Global Database seconda
 scripts/                         lib.sh (identity guard), deploy.sh, deploy_secondary.sh, push_image.sh, run_task.sh,
                                  render_taskdef.py, dr_drill.py, orders_e2e.py, teardown.sh,
                                  load_test.py, check_dashboard.py
-docs/                            load-test CSVs, dashboard images, cost estimate (later)
+docs/                            load-test CSVs, dashboard images, cost estimate, CI/CD explainer
+well-architected-review/         Well-Architected review: answers as code, scripts, results
 requirements-scripts.txt         boto3 for the scripts
 docker-compose.yml               local Postgres + seed + service
 docker-compose.tracing.yml       optional: local ADOT collector for span checks
