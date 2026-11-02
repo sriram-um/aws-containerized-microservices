@@ -24,19 +24,11 @@ args=(--stack-name "$STACK_NAME" --template-file template.yaml
       --capabilities CAPABILITY_NAMED_IAM
       --tags project=containerized-microservices
       --no-fail-on-empty-changeset)
-overrides=("$@")
-# Exercise 3 baseline: the DB password lives outside the repo (generated on first use) and is
-# passed as a NoEcho parameter. Exercise 9 moves it to Secrets Manager.
-SECRETS_FILE="$HOME/.containerized-microservices.env"
-if [[ ! -f "$SECRETS_FILE" ]]; then
-  umask 077
-  echo "DB_PASSWORD=$(.venv/Scripts/python -c 'import secrets; print(secrets.token_urlsafe(24))')" > "$SECRETS_FILE"
-  echo "Generated DB password in $SECRETS_FILE"
+# (Exercises 3-8 generated the DB password into ~/.containerized-microservices.env and passed it
+# as a parameter. Since exercise 9 Secrets Manager generates it; no secret passes through here.)
+if [[ $# -gt 0 ]]; then
+  args+=(--parameter-overrides "$@")
 fi
-if [[ " $* " != *" DBPassword="* ]]; then
-  overrides+=("DBPassword=$(grep '^DB_PASSWORD=' "$SECRETS_FILE" | cut -d= -f2-)")
-fi
-args+=(--parameter-overrides "${overrides[@]}")
 aws cloudformation deploy "${args[@]}"
 
 aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
