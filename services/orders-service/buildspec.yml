@@ -36,6 +36,9 @@ phases:
       - cat image.env
 
 artifacts:
+  # Everything the Deploy stage needs: it runs on this artifact, not on the source - including its
+  # own buildspec (the first run failed with "deployspec.yml: no such file or directory")
   files:
     - image.env
     - scripts/render_taskdef.py
+    - services/orders-service/deployspec.yml
