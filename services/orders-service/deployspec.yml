@@ -17,11 +17,15 @@ phases:
       - NEW_TD=$(aws ecs register-task-definition --cli-input-json file://taskdef.json --query taskDefinition.taskDefinitionArn --output text)
       - echo "registered $NEW_TD"
       - aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$NEW_TD" --query 'service.deployments[0].id' --output text
-      # services-stable works for the ECS deployment controller (not for CODE_DEPLOY services)
-      - aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+      # Wait for the deployment's rolloutState (not `wait services-stable`: it returns as soon as the
+      # task counts match, while the rollout is still IN_PROGRESS until the old tasks have drained).
+      # FAILED = the circuit breaker stopped it and rolled back to the previous revision.
       - |
-        STATE=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].deployments[?status==`PRIMARY`].rolloutState|[0]' --output text)
+        for i in $(seq 1 90); do
+          STATE=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query "services[0].deployments[?taskDefinition=='$NEW_TD'].rolloutState|[0]" --output text)
+          [ "$STATE" = "COMPLETED" ] || [ "$STATE" = "FAILED" ] && break
+          sleep 10
+        done
         RUNNING_TD=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].taskDefinition' --output text)
-        echo "rolloutState=$STATE running=$RUNNING_TD"
-        # The circuit breaker may have rolled back to the previous revision: fail the pipeline then
+        echo "rolloutState=$STATE running=$RUNNING_TD after $((i * 10)) s"
         [ "$STATE" = "COMPLETED" ] && [ "$RUNNING_TD" = "$NEW_TD" ]
