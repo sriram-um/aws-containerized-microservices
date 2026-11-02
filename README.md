@@ -31,8 +31,8 @@ same `template.yaml` and is deployed as an update to a single CloudFormation sta
 | 9 | Database credentials | AWS Secrets Manager | ✅ Done |
 | 10 | Disaster recovery | Aurora Global Database | ✅ Done |
 | 11 | Cost estimate | AWS Pricing Calculator | ✅ Done ([docs/cost-estimate.md](docs/cost-estimate.md)) |
-| 12 | Real-world project | Orders service (Project 3) on ECS | ⏳ Next |
-| 13 | Close-out | Well-Architected review, teardown/rebuild | ⬜ |
+| 12 | Real-world project | Orders service (Project 3) on ECS | ✅ Done |
+| 13 | Close-out | Teardown (Well-Architected review: see Phase 13) | ⏳ Next |
 
 ## Process
 
@@ -1074,6 +1074,73 @@ Full estimate with every line item and the AWS Pricing Calculator entries:
 - The build day itself cost an estimated **$3-4**. Not yet verifiable per project: Cost Explorer
   lags 24 h and the `project` cost-allocation tag is **inactive** in this account. The actual
   Fargate Spot discount (assumed 70 %) is checked the same way.
+
+### Phase 12 — Real-world project: Project 3's orders API as a second ECS service (2026-11-01)
+
+**What moved from serverless to containers:** Project 3's `POST /orders` and
+`GET /orders/{orderId}` (CreateOrder/GetOrder Lambdas behind API Gateway with a Cognito
+authorizer) are now [`services/orders-service`](services/orders-service), a FastAPI service on
+Fargate behind the **same ALB** as the Product Service. Validation rules, the DynamoDB data model
+(`orderId` + `itemId`, one item per order line), owner-only reads (foreign order = `404`) and the
+responses are unchanged. Analytics and DAX stayed out of scope (agreed).
+
+```
+                       ┌─ default action ──► product target groups (CodeDeploy blue/green) ─► product-api
+ internet ─► ALB :80 ──┤
+                       └─ rule /orders, /orders/* ─► orders target group ─► orders-api (ECS rolling)
+                                                                               │ ID token check: JWKS via
+                                                                               │   cognito-idp endpoint
+                                                                               └─► DynamoDB via gateway endpoint
+```
+
+| Piece | Implementation |
+|---|---|
+| Identity | Cognito user pool **Lite**, admin-only sign-up, password policy as Project 3, **no domain** (a pool with a domain can't be used through the `cognito-idp` VPC endpoint), app client without secret (`USER_PASSWORD_AUTH`) |
+| Token check | In the app ([`auth.py`](services/orders-service/orders_service/auth.py)): RS256 signature against the pool's JWKS (cached 1 h), `iss`, `aud` = app client, `token_use = id`, `exp`; `customerId` = verified `sub`, never the body |
+| Data | DynamoDB on-demand table; **gateway endpoint** (free); task role allows only `BatchWriteItem`/`PutItem`/`Query` on this table |
+| Network | Own security group (3000 from the ALB only; no access to Aurora); listener **rule** on :80 (the listener itself stays untouched, because CodeDeploy owns its default action) |
+| Deployment | **ECS rolling** (deployment circuit breaker with rollback), on purpose different from the product service's CodeDeploy blue/green; Fargate base 1 + Spot weight 3 directly on the service (allowed with the ECS controller) |
+| Pipeline | Second CodePipeline `…-orders-service`, trigger `services/orders-service/**`: Build ([`buildspec.yml`](services/orders-service/buildspec.yml): tests, image) → Deploy ([`deployspec.yml`](services/orders-service/deployspec.yml): render the CloudFormation task definition with the new image, register, `update-service`, wait for `rolloutState`, fail if the circuit breaker rolled back) |
+| Tests | 22 unit tests (moto DynamoDB, local RSA key pair for tokens: expired, wrong audience/issuer, access token, tampered, missing); [`scripts/orders_e2e.py`](scripts/orders_e2e.py) end-to-end through the ALB with two Cognito users (passwords outside the repo) |
+
+**Measured**
+
+| What | Result |
+|---|---|
+| JWKS through the `cognito-idp` endpoint | `200` in 33-116 ms from both AZs (after the endpoint had settled, see issues) |
+| End-to-end checks | **57/57** (401 without/with a tampered token, 201 create, 200 own order, **404 for another user's order**, 400 validation, product API unaffected) |
+| Latency laptop → ALB → Fargate → DynamoDB (50 pairs) | POST p50 **61 ms** / p95 86 ms; GET p50 **58 ms** / p95 82 ms |
+| First request after a task start | ~500-580 ms (JWKS download + boto3 clients), then cached |
+| Orders pipeline (successful run) | 331 s: build ~90 s, rolling deployment **180 s** to `COMPLETED`; **465/465** probe requests answered (expected `401` without token), no gap |
+| Both pipelines from one push | product and orders pipelines each started via `WebhookV2`; README-only pushes start neither |
+
+**Lambda (Project 3) vs ECS (this project), same API**
+
+| | Project 3: API Gateway + Lambda | Project 5: ALB + Fargate |
+|---|---|---|
+| First request | **1.20 s** (cold start, Init ~380-420 ms) | ~0.5 s once per task (JWKS + clients); no per-request cold start |
+| Warm latency seen by the client | 104-121 ms (incl. WAF + Cognito authorizer) | **~60 ms** p50 |
+| Cost with no traffic | ≈ $0 for the functions (pay per request) | 2 tasks ≈ $9.40/month + share of ALB/endpoints |
+| Scaling | per request, automatic | target tracking, ~1 min per step (Phase 7) |
+| Auth | API Gateway Cognito authorizer (no code) | JWT verification in the app (code + tests, JWKS reachability) |
+| Deploy | SAM + GitHub Actions, seconds | image build + rolling/blue-green, 3-14 min |
+
+For a small, spiky API the Lambda version is cheaper and simpler. The container version wins on
+steady latency, has no cold starts per request, and runs any long-lived process. Its fixed cost
+is mostly the network around it (ALB, endpoints), not the containers.
+
+**Issues hit and fixes**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Stack update failed: `The VPC endpoint service com.amazonaws.us-east-1.cognito-idp does not support the availability zone` | `cognito-idp` endpoints exist only in us-east-1b/c/d for this account (not use1-az1) | Endpoint in private subnet B only; tasks in 1a reach it across AZs (`describe-vpc-endpoint-services` → `AvailabilityZones`) |
+| First JWKS probe timed out although DNS resolved to the endpoint and it was `available` | Probe ran ~2 min after the endpoint was created | Same probe minutes later: 200 from both AZs. Wait a few minutes after creating an interface endpoint before testing it |
+| Orders Deploy stage: `deployspec.yml: no such file or directory` | A CodeBuild action in a later stage runs on its **input artifact**, not on the source | Add `deployspec.yml` to the Build stage's artifacts |
+| Deploy stage failed although the rollout succeeded | `aws ecs wait services-stable` returned while `rolloutState` was still `IN_PROGRESS` | Poll `deployments[?taskDefinition==NEW].rolloutState` until `COMPLETED`/`FAILED` |
+| Product pipeline would have run the orders tests | `pytest` from the repo root now collected `services/orders-service/tests` | Each buildspec runs only its own service's tests |
+
+**Costs added:** `cognito-idp` endpoint (1 AZ) $0.01/h, 2 Fargate tasks ≈ $0.013/h, DynamoDB
+on-demand and Cognito Lite: cents. Running total ≈ **$0.29/h**.
 
 ## Repository layout
 
